@@ -1,0 +1,295 @@
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+
+import '../models/activity_model.dart';
+import '../models/asset_model.dart';
+
+class SnipeITException implements Exception {
+  final String message;
+  final int? statusCode;
+
+  const SnipeITException(this.message, {this.statusCode});
+
+  @override
+  String toString() => 'SnipeITException($statusCode): $message';
+}
+
+class SnipeITService {
+  late final Dio _dio;
+
+  String get _baseUrl =>
+      dotenv.env['SNIPEIT_BASE_URL'] ?? 'https://your-snipeit.com';
+  String get _token => dotenv.env['SNIPEIT_API_TOKEN'] ?? '';
+
+  SnipeITService() {
+    _dio = Dio(BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 20),
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+    ));
+
+    _dio.interceptors.add(InterceptorsWrapper(
+      onRequest: (options, handler) {
+        options.baseUrl = '$_baseUrl/api/v1/';
+        options.headers['Authorization'] = 'Bearer $_token';
+        handler.next(options);
+      },
+      onError: (error, handler) {
+        final statusCode = error.response?.statusCode;
+        final message = _extractErrorMessage(error.response?.data) ??
+            error.message ??
+            'Unknown error';
+        handler.reject(
+          DioException(
+            requestOptions: error.requestOptions,
+            error: SnipeITException(message, statusCode: statusCode),
+            response: error.response,
+            type: error.type,
+          ),
+        );
+      },
+    ));
+  }
+
+  // ── Assets ─────────────────────────────────────────────────────────────────
+
+  Future<AssetModel?> getAssetByTag(String assetTag) async {
+    try {
+      final response = await _dio.get('hardware/bytag/$assetTag');
+      final data = response.data as Map<String, dynamic>;
+
+      print('=== getAssetByTag response ===');
+      print(data);
+
+      if (data['status'] == 'error') return null;
+      if (data['id'] == null) return null;
+
+      return AssetModel.fromJson(data);
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 404) return null;
+      if (e.response?.data?['status'] == 'error') return null;
+      rethrow;
+    }
+  }
+
+  Future<AssetModel> getAssetById(int id) async {
+    final response = await _dio.get('hardware/$id');
+    return AssetModel.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  Future<AssetModel> createAsset({
+    required int modelId,
+    required int statusId,
+    required String assetTag,
+    String? serial,
+    String? name,
+    String? notes,
+  }) async {
+    final body = {
+      'model_id': modelId,
+      'status_id': statusId,
+      'asset_tag': assetTag,
+      if (serial != null) 'serial': serial,
+      if (name != null) 'name': name,
+      if (notes != null) 'notes': notes,
+    };
+    final response = await _dio.post('hardware', data: body);
+    final payload = response.data as Map<String, dynamic>;
+    _assertSuccess(payload);
+    return AssetModel.fromJson(payload['payload'] as Map<String, dynamic>);
+  }
+
+  Future<AssetModel> updateAsset(int id, Map<String, dynamic> fields) async {
+    final response = await _dio.patch('hardware/$id', data: fields);
+    final payload = response.data as Map<String, dynamic>;
+    _assertSuccess(payload);
+    return AssetModel.fromJson(payload['payload'] as Map<String, dynamic>);
+  }
+
+  // ── Check-Out ──────────────────────────────────────────────────────────────
+
+  Future<void> checkOutAsset({
+    required int assetId,
+    required int userId,
+    String? checkoutAt,
+    String? note,
+  }) async {
+    final body = {
+      'checkout_to_type': 'user',
+      'assigned_user': userId,
+      'checkout_at':
+          checkoutAt ?? DateTime.now().toIso8601String().split('T').first,
+      if (note != null) 'note': note,
+    };
+    final response =
+        await _dio.post('hardware/$assetId/checkout', data: body);
+    _assertSuccess(response.data as Map<String, dynamic>);
+  }
+
+  Future<void> checkOutAssetByName({
+    required int assetId,
+    required String assigneeName,
+    String? note,
+  }) async {
+    final body = {
+      'checkout_to_type': 'user',
+      'assigned_user': 1,
+      'checkout_at': DateTime.now().toIso8601String().split('T').first,
+      'note': note ?? 'Checked out to: $assigneeName',
+    };
+    final response =
+        await _dio.post('hardware/$assetId/checkout', data: body);
+    _assertSuccess(response.data as Map<String, dynamic>);
+  }
+
+  // ── Check-In ───────────────────────────────────────────────────────────────
+
+  Future<void> checkInAsset({
+    required int assetId,
+    String? note,
+  }) async {
+    final body = {
+      if (note != null) 'note': note,
+    };
+    final response =
+        await _dio.post('hardware/$assetId/checkin', data: body);
+    _assertSuccess(response.data as Map<String, dynamic>);
+  }
+
+  // ── Activity / History ─────────────────────────────────────────────────────
+
+  Future<List<ActivityModel>> getAssetHistory(int assetId) async {
+    final response = await _dio.get(
+      'reports/activity',
+      queryParameters: {
+        'item_type': 'asset',
+        'item_id': assetId,
+        'limit': 50,
+        'offset': 0,
+        'sort': 'created_at',
+        'order': 'desc',
+      },
+    );
+    final rows = (response.data['rows'] as List<dynamic>? ?? []);
+    return rows
+        .map((e) => ActivityModel.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  // ── Users ──────────────────────────────────────────────────────────────────
+
+  Future<List<AssetUser>> searchUsers(String query) async {
+    final response = await _dio.get(
+      'users',
+      queryParameters: {'search': query, 'limit': 20},
+    );
+    final rows = response.data['rows'] as List<dynamic>? ?? [];
+    return rows
+        .map((e) => AssetUser.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  // ── Manufacturers ──────────────────────────────────────────────────────────
+
+  Future<List<AssetManufacturer>> getManufacturers() async {
+    final response =
+        await _dio.get('manufacturers', queryParameters: {'limit': 100});
+    final rows = response.data['rows'] as List<dynamic>? ?? [];
+    return rows
+        .map((e) => AssetManufacturer.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  // ── Models ─────────────────────────────────────────────────────────────────
+
+  Future<List<AssetModel2>> getModels({int? manufacturerId}) async {
+    final response = await _dio.get(
+      'models',
+      queryParameters: {
+        'limit': 100,
+        if (manufacturerId != null) 'manufacturer_id': manufacturerId,
+      },
+    );
+    final rows = response.data['rows'] as List<dynamic>? ?? [];
+    return rows
+        .map((e) => AssetModel2.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  // ── Status Labels ──────────────────────────────────────────────────────────
+
+  Future<List<AssetStatus>> getStatusLabels() async {
+    final response =
+        await _dio.get('statuslabels', queryParameters: {'limit': 50});
+    final rows = response.data['rows'] as List<dynamic>? ?? [];
+    return rows
+        .map((e) => AssetStatus.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  // ── File Uploads / Signatures ──────────────────────────────────────────────
+
+  Future<bool> uploadSignature({
+    required int assetId,
+    required Uint8List pngBytes,
+    String filename = 'signature.png',
+  }) async {
+    print('=== [Upload] START assetId=$assetId bytes=${pngBytes.length} file=$filename');
+
+    final formData = FormData.fromMap({
+      'file': MultipartFile.fromBytes(
+        pngBytes,
+        filename: filename,
+        contentType: DioMediaType('image', 'png'),
+      ),
+    });
+
+    // ใช้ Dio ใหม่แยกต่างหาก เพื่อหลีกเลี่ยง interceptor ที่ set Content-Type เป็น json
+    final uploadDio = Dio(BaseOptions(
+      baseUrl: '$_baseUrl/api/v1/',
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(seconds: 30),
+      headers: {
+        'Authorization': 'Bearer $_token',
+        'Accept': 'application/json',
+        // ไม่ set Content-Type — Dio จะ set multipart/form-data + boundary เอง
+      },
+    ));
+
+    final response = await uploadDio.post(
+      'hardware/$assetId/uploads',
+      data: formData,
+    );
+
+    print('=== [Upload] status=${response.statusCode} data=${response.data}');
+
+    final ok = response.data?['status'] == 'success';
+    print('=== [Upload] success=$ok');
+    return ok;
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  void _assertSuccess(Map<String, dynamic> payload) {
+    final status = payload['status'] as String?;
+    if (status != 'success') {
+      final messages = payload['messages'];
+      final msg = messages is String
+          ? messages
+          : (messages is Map ? messages.values.join(', ') : 'Request failed');
+      throw SnipeITException(msg);
+    }
+  }
+
+  String? _extractErrorMessage(dynamic data) {
+    if (data is Map<String, dynamic>) {
+      return data['messages']?.toString() ?? data['message']?.toString();
+    }
+    return null;
+  }
+}
