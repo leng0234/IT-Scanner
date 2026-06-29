@@ -15,6 +15,7 @@ class AssetModel {
   final String? lastCheckout;
   final String? createdAt;
   final String? updatedAt;
+  final Map<String, dynamic>? customFields;
 
   const AssetModel({
     this.id,
@@ -31,6 +32,7 @@ class AssetModel {
     this.lastCheckout,
     this.createdAt,
     this.updatedAt,
+    this.customFields,
   });
 
   factory AssetModel.fromJson(Map<String, dynamic> json) {
@@ -59,6 +61,7 @@ class AssetModel {
       lastCheckout: _parseDate(json['last_checkout']),
       createdAt: _parseDate(json['created_at']),
       updatedAt: _parseDate(json['updated_at']),
+      customFields: json['custom_fields'] as Map<String, dynamic>?,
     );
   }
 
@@ -114,8 +117,16 @@ class AssetUser {
   final String? username;
   final String? email;
   final String? type;
+  final String? department; // เพิ่ม: ดึงจาก department ของ User ใน Snipe-IT
 
-  const AssetUser({this.id, this.name, this.username, this.email, this.type});
+  const AssetUser({
+    this.id,
+    this.name,
+    this.username,
+    this.email,
+    this.type,
+    this.department,
+  });
 
   factory AssetUser.fromJson(Map<String, dynamic> json) => AssetUser(
         id: _parseInt(json['id']),
@@ -123,6 +134,8 @@ class AssetUser {
         username: json['username'] as String?,
         email: json['email'] as String?,
         type: json['type'] as String?,
+        // Snipe-IT ส่ง department เป็น object {"id":1,"name":"IT"} หรือ String
+        department: _parseDepartment(json['department']),
       );
 }
 
@@ -144,5 +157,13 @@ String? _parseDate(dynamic value) {
   if (value is Map) {
     return value['formatted']?.toString() ?? value['datetime']?.toString();
   }
+  return null;
+}
+
+/// Snipe-IT ส่ง department เป็น {"id":1,"name":"IT"} หรือ String ตรงๆ
+String? _parseDepartment(dynamic value) {
+  if (value == null) return null;
+  if (value is String) return value;
+  if (value is Map) return value['name']?.toString();
   return null;
 }

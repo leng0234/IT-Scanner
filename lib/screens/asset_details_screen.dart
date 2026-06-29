@@ -99,8 +99,13 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
       context: context,
       title: 'ลายเซ็นการเบิกอุปกรณ์',
       subtitle: 'เซ็นชื่อเพื่อยืนยันการรับ ${_asset.assetTag ?? _asset.serial}',
+      asset: _asset,
+      assigneeName: user.name,
+      division: user.department, // ส่ง department ของ user ที่เลือก
+      isCheckOut: true,
     );
-    if (sig == null || !mounted) return;
+
+    if (sig == null || sig.isEmpty || !mounted) return;
 
     setState(() => _actionLoading = true);
     try {
@@ -110,22 +115,32 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
         note: 'เบิกอุปกรณ์ผ่าน IT Asset Manager app',
       );
 
-      if (sig.isNotEmpty) {
+      try {
+        final now = DateTime.now();
+        final mm = now.month.toString().padLeft(2, '0');
+        final dd = now.day.toString().padLeft(2, '0');
+        final hh = now.hour.toString().padLeft(2, '0');
+        final min = now.minute.toString().padLeft(2, '0');
+        final filename = 'checkout_sig_${now.year}$mm${dd}_$hh$min.png';
+
+        await _service.uploadSignatureToUser(
+          userId: user.id!,
+          pngBytes: sig,
+          filename: filename,
+        );
         try {
-          final uploaded = await _service.uploadSignature(
+          await _service.uploadSignature(
             assetId: _asset.id!,
             pngBytes: sig,
-            filename: 'checkout_sig_${DateTime.now().millisecondsSinceEpoch}.png',
+            filename: filename,
           );
-          print('=== [CheckOut] signature uploaded=$uploaded');
-        } catch (uploadErr) {
-          print('=== [CheckOut] upload error: $uploadErr');
-        }
+        } catch (_) {}
+      } catch (uploadErr) {
+        debugPrint('Upload error: $uploadErr');
       }
 
       await _refreshAsset();
       await _loadHistory();
-
       if (mounted) _showSuccessSnack('เบิกอุปกรณ์ให้ ${user.name} สำเร็จ');
     } catch (e) {
       if (mounted) _showErrorSnack('เบิกอุปกรณ์ล้มเหลว: $e');
@@ -138,12 +153,26 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
   Future<void> _handleCheckIn() async {
     if (_asset.id == null) return;
 
+    // fetch user เต็มเพื่อให้ได้ department (assigned_to ใน asset มีแค่ id/name)
+    String? division;
+    final assignedId = _asset.assignedTo?.id;
+    if (assignedId != null) {
+      try {
+        final fullUser = await _service.getUserById(assignedId);
+        division = fullUser?.department;
+      } catch (_) {}
+    }
+
     final sig = await showSignatureDialog(
       context: context,
       title: 'ลายเซ็นการคืนอุปกรณ์',
       subtitle: 'เซ็นชื่อเพื่อยืนยันการคืน ${_asset.assetTag ?? _asset.serial}',
+      asset: _asset,
+      assigneeName: _asset.assignedTo?.name,
+      division: division,
+      isCheckOut: false,
     );
-    if (sig == null || !mounted) return;
+    if (sig == null || sig.isEmpty || !mounted) return;
 
     setState(() => _actionLoading = true);
     try {
@@ -152,22 +181,38 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
         note: 'คืนอุปกรณ์ผ่าน IT Asset Manager app',
       );
 
-      if (sig.isNotEmpty) {
+      try {
+        final now = DateTime.now();
+        final mm = now.month.toString().padLeft(2, '0');
+        final dd = now.day.toString().padLeft(2, '0');
+        final hh = now.hour.toString().padLeft(2, '0');
+        final min = now.minute.toString().padLeft(2, '0');
+        final filename = 'checkin_sig_${now.year}$mm${dd}_$hh$min.png';
+        final assignedUserId = _asset.assignedTo?.id;
+
+        if (assignedUserId != null) {
+          try {
+            await _service.uploadSignatureToUser(
+              userId: assignedUserId,
+              pngBytes: sig,
+              filename: filename,
+            );
+          } catch (_) {}
+        }
+
         try {
-          final uploaded = await _service.uploadSignature(
+          await _service.uploadSignature(
             assetId: _asset.id!,
             pngBytes: sig,
-            filename: 'checkin_sig_${DateTime.now().millisecondsSinceEpoch}.png',
+            filename: filename,
           );
-          print('=== [CheckIn] signature uploaded=$uploaded');
-        } catch (uploadErr) {
-          print('=== [CheckIn] upload error: $uploadErr');
-        }
+        } catch (_) {}
+      } catch (uploadErr) {
+        debugPrint('Upload error: $uploadErr');
       }
 
       await _refreshAsset();
       await _loadHistory();
-
       if (mounted) _showSuccessSnack('คืนอุปกรณ์สำเร็จ');
     } catch (e) {
       if (mounted) _showErrorSnack('คืนอุปกรณ์ล้มเหลว: $e');
@@ -219,9 +264,8 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
 
   @override
   Widget build(BuildContext context) {
-    // ถ้ามีคนถืออยู่ (assignedTo มี id) = isCheckedOut
-    final isCheckedOut = _asset.assignedTo != null &&
-        _asset.assignedTo!.id != null;
+    final isCheckedOut =
+        _asset.assignedTo != null && _asset.assignedTo!.id != null;
 
     return Scaffold(
       appBar: AppBar(
@@ -268,20 +312,19 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
           decoration: const BoxDecoration(
             color: AppConstants.surfaceCard,
-            border: Border(
-                top: BorderSide(color: AppConstants.divider, width: 1)),
+            border:
+                Border(top: BorderSide(color: AppConstants.divider, width: 1)),
           ),
           child: SizedBox(
             width: double.infinity,
             child: isCheckedOut
-                // ── มีคนถืออยู่ → ปุ่มคืนอุปกรณ์ ────────────────────────
                 ? OutlinedButton.icon(
                     onPressed: _actionLoading ? null : _handleCheckIn,
                     icon: const Icon(Icons.login, size: 18),
                     label: const Text(
                       'คืนอุปกรณ์',
-                      style: TextStyle(
-                          fontSize: 16, fontWeight: FontWeight.w600),
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
                     ),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: AppConstants.accentGreen,
@@ -290,14 +333,13 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
                       minimumSize: const Size(double.infinity, 52),
                     ),
                   )
-                // ── ว่างอยู่ → ปุ่มเบิกอุปกรณ์ ───────────────────────────
                 : ElevatedButton.icon(
                     onPressed: _actionLoading ? null : _handleCheckOut,
                     icon: const Icon(Icons.logout, size: 18),
                     label: const Text(
                       'เบิกอุปกรณ์',
-                      style: TextStyle(
-                          fontSize: 16, fontWeight: FontWeight.w600),
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
                     ),
                     style: ElevatedButton.styleFrom(
                       minimumSize: const Size(double.infinity, 52),
@@ -375,8 +417,7 @@ class _DetailsTab extends StatelessWidget {
         Card(
           child: Column(
             children: [
-              InfoRow(
-                  label: 'Manufacturer', value: asset.manufacturer?.name),
+              InfoRow(label: 'Manufacturer', value: asset.manufacturer?.name),
               const CardDivider(),
               InfoRow(label: 'Model', value: asset.model?.name),
               const CardDivider(),
@@ -393,29 +434,28 @@ class _DetailsTab extends StatelessWidget {
             children: [
               InfoRow(
                 label: 'Assigned To',
-                valueWidget: asset.assignedTo != null &&
-                        asset.assignedTo!.id != null
-                    ? Row(
-                        children: [
-                          const Icon(Icons.person,
-                              size: 16, color: AppConstants.accentBlue),
-                          const SizedBox(width: 6),
-                          Text(
-                            asset.assignedTo!.name ?? '—',
-                            style: const TextStyle(
-                              color: AppConstants.accentBlue,
-                              fontWeight: FontWeight.w600,
-                              fontSize: 13,
-                            ),
+                valueWidget:
+                    asset.assignedTo != null && asset.assignedTo!.id != null
+                        ? Row(
+                            children: [
+                              const Icon(Icons.person,
+                                  size: 16, color: AppConstants.accentBlue),
+                              const SizedBox(width: 6),
+                              Text(
+                                asset.assignedTo!.name ?? '—',
+                                style: const TextStyle(
+                                  color: AppConstants.accentBlue,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
+                          )
+                        : const Text(
+                            'ไม่มีผู้ถือครอง',
+                            style: TextStyle(
+                                color: AppConstants.textSecondary, fontSize: 13),
                           ),
-                        ],
-                      )
-                    : const Text(
-                        'ไม่มีผู้ถือครอง',
-                        style: TextStyle(
-                            color: AppConstants.textSecondary,
-                            fontSize: 13),
-                      ),
               ),
               const CardDivider(),
               InfoRow(label: 'Last Checkout', value: asset.lastCheckout),
@@ -564,8 +604,7 @@ class _HistoryTile extends StatelessWidget {
                 ),
                 child: Icon(icon, color: color, size: 16),
               ),
-              Container(
-                  width: 1, height: 20, color: AppConstants.divider),
+              Container(width: 1, height: 20, color: AppConstants.divider),
             ],
           ),
           const SizedBox(width: 12),
@@ -586,8 +625,7 @@ class _HistoryTile extends StatelessWidget {
                     if (entry.target?.name != null) ...[
                       const Text(' → ',
                           style: TextStyle(
-                              color: AppConstants.textSecondary,
-                              fontSize: 13)),
+                              color: AppConstants.textSecondary, fontSize: 13)),
                       Flexible(
                         child: Text(
                           entry.target!.name!,
@@ -697,10 +735,8 @@ class _UserSearchDialogState extends State<_UserSearchDialog> {
   @override
   Widget build(BuildContext context) {
     return Dialog(
-      insetPadding:
-          const EdgeInsets.symmetric(horizontal: 20, vertical: 60),
-      shape:
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 60),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: Column(
         children: [
           // ── Header ──────────────────────────────────────────────────────
@@ -708,8 +744,7 @@ class _UserSearchDialogState extends State<_UserSearchDialog> {
             padding: const EdgeInsets.fromLTRB(20, 20, 12, 16),
             decoration: const BoxDecoration(
               color: AppConstants.primaryNavy,
-              borderRadius:
-                  BorderRadius.vertical(top: Radius.circular(16)),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
             ),
             child: Row(
               children: [
@@ -808,8 +843,8 @@ class _UserSearchDialogState extends State<_UserSearchDialog> {
                               final user = _results[i];
                               return ListTile(
                                 leading: CircleAvatar(
-                                  backgroundColor: AppConstants.accentBlue
-                                      .withOpacity(0.12),
+                                  backgroundColor:
+                                      AppConstants.accentBlue.withOpacity(0.12),
                                   child: Text(
                                     (user.name?.isNotEmpty == true
                                             ? user.name![0]
@@ -827,13 +862,16 @@ class _UserSearchDialogState extends State<_UserSearchDialog> {
                                       fontWeight: FontWeight.w600),
                                 ),
                                 subtitle: Text(
-                                  user.username ?? user.email ?? '',
+                                  [
+                                    if (user.username != null) user.username!,
+                                    if (user.department != null)
+                                      user.department!,
+                                  ].join(' · '),
                                   style: const TextStyle(
                                       fontSize: 12,
                                       color: AppConstants.textSecondary),
                                 ),
-                                onTap: () =>
-                                    Navigator.of(context).pop(user),
+                                onTap: () => Navigator.of(context).pop(user),
                               );
                             },
                           ),

@@ -1,21 +1,23 @@
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr/qr.dart';
 import 'package:signature/signature.dart';
 import 'package:universal_html/html.dart' as html;
 
 import '../models/asset_model.dart';
 import '../utils/app_constants.dart';
 
-/// แสดง dialog เซ็นชื่อ แล้ว generate PDF A4 สำหรับดาวน์โหลด
-/// Returns PNG bytes ของลายเซ็น หรือ Uint8List(0) ถ้า Skip หรือ null ถ้ายกเลิก
 Future<Uint8List?> showSignatureDialog({
   required BuildContext context,
   required String title,
   String? subtitle,
   AssetModel? asset,
   String? assigneeName,
+  String? division,
   bool isCheckOut = true,
 }) {
   return showDialog<Uint8List?>(
@@ -26,6 +28,7 @@ Future<Uint8List?> showSignatureDialog({
       subtitle: subtitle,
       asset: asset,
       assigneeName: assigneeName,
+      division: division,
       isCheckOut: isCheckOut,
     ),
   );
@@ -36,6 +39,7 @@ class _SignatureDialog extends StatefulWidget {
   final String? subtitle;
   final AssetModel? asset;
   final String? assigneeName;
+  final String? division;
   final bool isCheckOut;
 
   const _SignatureDialog({
@@ -43,6 +47,7 @@ class _SignatureDialog extends StatefulWidget {
     this.subtitle,
     this.asset,
     this.assigneeName,
+    this.division,
     this.isCheckOut = true,
   });
 
@@ -73,6 +78,8 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     _controller.dispose();
     super.dispose();
   }
+
+  // ── Export signature PNG ───────────────────────────────────────────────────
 
   Future<Uint8List?> _exportSignatureBytes() async {
     Uint8List? pngBytes;
@@ -120,6 +127,74 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     return pngBytes;
   }
 
+  // ── Verification helpers ───────────────────────────────────────────────────
+
+  /// FNV-1a 32-bit hash (JS-safe)
+  String _generateHash(String data) {
+    final bytes = utf8.encode(data);
+    var hash = 0x811c9dc5;
+    for (final byte in bytes) {
+      hash ^= byte;
+      hash = (hash * 0x01000193) & 0xFFFFFFFF;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
+  }
+
+  String _generateVerificationCode({
+    required String assetTag,
+    required String assigneeName,
+    required String dateStr,
+    required String action,
+    required Uint8List sigBytes,
+  }) {
+    final sigFingerprint = sigBytes
+        .take(32)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+
+    final payload =
+        '$assetTag|$assigneeName|$dateStr|$action|$sigFingerprint';
+    final hash = _generateHash(payload);
+
+    final nameHash = _generateHash(assigneeName);
+    return '${hash.substring(0, 4)}-${hash.substring(4, 8)}-'
+            '${nameHash.substring(0, 4)}-${nameHash.substring(4, 8)}'
+        .toUpperCase();
+  }
+
+  /// Generate QR SVG from string data (uses package qr)
+  String _generateQrSvg(String data) {
+    final qr = QrCode.fromData(
+      data: data,
+      errorCorrectLevel: QrErrorCorrectLevel.M,
+    );
+    final qrImage = QrImage(qr);
+    final size = qr.moduleCount;
+    const cellSize = 4;
+    const padding = 8;
+    final svgSize = size * cellSize + padding * 2;
+
+    final sb = StringBuffer();
+    sb.write(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="$svgSize" height="$svgSize">');
+    sb.write('<rect width="$svgSize" height="$svgSize" fill="white"/>');
+
+    for (var row = 0; row < size; row++) {
+      for (var col = 0; col < size; col++) {
+        if (qrImage.isDark(row, col)) {
+          final x = col * cellSize + padding;
+          final y = row * cellSize + padding;
+          sb.write(
+              '<rect x="$x" y="$y" width="$cellSize" height="$cellSize" fill="black"/>');
+        }
+      }
+    }
+    sb.write('</svg>');
+    return sb.toString();
+  }
+
+  // ── Confirm ────────────────────────────────────────────────────────────────
+
   Future<void> _confirm() async {
     if (_controller.isEmpty) return;
     setState(() {
@@ -133,14 +208,13 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       if (pngBytes == null || pngBytes.isEmpty) {
         setState(() {
           _isExporting = false;
-          _exportError = 'ไม่สามารถบันทึกลายเซ็นได้ กรุณาลองใหม่';
+          _exportError = 'Cannot save signature. Please try again.';
         });
         return;
       }
 
-      // Generate และ download PDF
       if (widget.asset != null) {
-        await _generateAndDownloadPdf(pngBytes);
+        await _generateAndDownloadHtml(pngBytes);
       }
 
       if (mounted) Navigator.of(context).pop(pngBytes);
@@ -148,31 +222,69 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       if (mounted) {
         setState(() {
           _isExporting = false;
-          _exportError = 'เกิดข้อผิดพลาด: $e';
+          _exportError = 'Error: $e';
         });
       }
     }
   }
 
-  Future<void> _generateAndDownloadPdf(Uint8List sigBytes) async {
+  // ── Generate & download HTML ───────────────────────────────────────────────
+
+  Future<void> _generateAndDownloadHtml(Uint8List sigBytes) async {
     final now = DateTime.now();
     final dateStr =
-        '${now.day}/${now.month}/${now.year} ${now.hour}:${now.minute.toString().padLeft(2, '0')} น.';
+        '${now.day}/${now.month}/${now.year} ${now.hour}:${now.minute.toString().padLeft(2, '0')}';
     final asset = widget.asset!;
-    final action = widget.isCheckOut ? 'เบิกอุปกรณ์' : 'คืนอุปกรณ์';
+    final action = widget.isCheckOut ? 'Checkout' : 'Checkin';
     final sigBase64 = _bytesToBase64(sigBytes);
 
-    final html = _buildHtml(
+    // Generate verification code
+    final verifyCode = _generateVerificationCode(
+      assetTag: asset.assetTag ?? '—',
+      assigneeName: widget.assigneeName ?? '—',
+      dateStr: dateStr,
+      action: action,
+      sigBytes: sigBytes,
+    );
+
+    // QR data
+    final qrData = [
+      'ASSET:${asset.assetTag ?? '—'}',
+      'ACTION:$action',
+      'RECIPIENT:${widget.assigneeName ?? '—'}',
+      'DIVISION:${widget.division ?? '—'}',
+      'DATE:$dateStr',
+      'SERIAL:${asset.serial ?? '—'}',
+      'VERIFY:$verifyCode',
+    ].join('\n');
+
+    final qrSvg = _generateQrSvg(qrData);
+    final qrBase64 = base64.encode(utf8.encode(qrSvg));
+
+    // Load logo from assets
+    String logoBase64 = '';
+    try {
+      final logoBytes = await rootBundle.load('assets/stream_logoNew.png');
+      logoBase64 = _bytesToBase64(logoBytes.buffer.asUint8List());
+    } catch (_) {}
+
+    final htmlContent = _buildHtml(
       action: action,
       dateStr: dateStr,
       asset: asset,
       assigneeName: widget.assigneeName ?? '—',
+      division: widget.division ?? '—',
       sigBase64: sigBase64,
+      customFields: asset.customFields ?? {},
+      logoBase64: logoBase64,
+      verifyCode: verifyCode,
+      qrBase64: qrBase64,
     );
 
-    // Download HTML as file (ใช้ได้บน Web + Mobile)
-    _downloadHtmlFile(html, action, now);
+    _downloadHtmlFile(htmlContent, action, now);
   }
+
+  // ── Base64 encoder ─────────────────────────────────────────────────────────
 
   String _bytesToBase64(Uint8List bytes) {
     const chars =
@@ -199,313 +311,299 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     }
   }
 
+  // ── Build HTML ─────────────────────────────────────────────────────────────
+
   String _buildHtml({
     required String action,
     required String dateStr,
     required AssetModel asset,
     required String assigneeName,
+    required String division,
     required String sigBase64,
+    Map<String, dynamic> customFields = const {},
+    String logoBase64 = '',
+    String verifyCode = '',
+    String qrBase64 = '',
   }) {
+    String getField(String key) {
+      final field = customFields[key];
+      if (field == null) return '—';
+      return field['value']?.toString() ?? '—';
+    }
+
     final tag = asset.assetTag ?? '—';
     final serial = asset.serial ?? '—';
     final name = asset.name ?? asset.model?.name ?? '—';
     final manufacturer = asset.manufacturer?.name ?? '—';
     final model = asset.model?.name ?? '—';
-    final status = asset.statusLabel?.name ?? '—';
+    final ram = getField('RAM');
+    final storageType = getField('Storage Type');
+    final capacity = getField('Capacity');
+    final monitor = getField('Monitor');
     final isCheckOut = widget.isCheckOut;
 
+    final logoTag = logoBase64.isNotEmpty
+        ? '<img src="data:image/png;base64,$logoBase64" alt="Logo" style="height:52px;">'
+        : '<div style="width:80px;"></div>';
+
     return '''<!DOCTYPE html>
-<html lang="th">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>$action — $tag</title>
+<title>Assets Profile — $tag</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&display=swap');
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: 'Sarabun', sans-serif;
-    font-size: 14px;
-    color: #0D1B2A;
+    font-size: 13px;
+    color: #000;
     background: #fff;
-    padding: 40px;
+    padding: 32px 40px;
     max-width: 794px;
     margin: 0 auto;
   }
-  /* ── Header ── */
   .header {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
-    border-bottom: 3px solid #0D1B2A;
-    padding-bottom: 16px;
-    margin-bottom: 24px;
-  }
-  .header-left h1 {
-    font-size: 22px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-  }
-  .header-left .subtitle {
-    font-size: 13px;
-    color: #607080;
-    margin-top: 4px;
-  }
-  .badge {
-    display: inline-block;
-    padding: 6px 16px;
-    border-radius: 6px;
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    color: #fff;
-    background: ${isCheckOut ? '#1A73E8' : '#00C48C'};
-  }
-  /* ── Section ── */
-  .section {
-    margin-bottom: 20px;
-  }
-  .section-title {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: #607080;
     margin-bottom: 10px;
-    padding-bottom: 4px;
-    border-bottom: 1px solid #E0E6EF;
   }
-  /* ── Info grid ── */
-  .info-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0;
-    border: 1px solid #E0E6EF;
-    border-radius: 8px;
-    overflow: hidden;
+  .header-center { text-align: center; flex: 1; padding: 0 16px; }
+  .header-center .company { font-size: 15px; font-weight: 700; }
+  .header-center .form-title {
+    font-size: 17px; font-weight: 700;
+    letter-spacing: 1px; margin-top: 2px;
   }
-  .info-row {
-    display: contents;
+  .header-right { text-align: right; font-size: 11px; color: #555; }
+  .type-row {
+    display: flex; align-items: center; gap: 24px;
+    border: 1.5px solid #000; border-bottom: none;
+    padding: 6px 14px; background: #f0f0f0;
   }
-  .info-label {
-    background: #F5F7FA;
-    padding: 9px 14px;
-    font-size: 12px;
-    color: #607080;
-    font-weight: 600;
-    border-bottom: 1px solid #E0E6EF;
+  .type-row label {
+    display: flex; align-items: center;
+    gap: 6px; font-weight: 600; font-size: 13px;
   }
-  .info-value {
-    background: #fff;
-    padding: 9px 14px;
-    font-size: 13px;
-    font-weight: 500;
-    border-bottom: 1px solid #E0E6EF;
-    border-left: 1px solid #E0E6EF;
+  .checkbox {
+    width: 14px; height: 14px; border: 1.5px solid #000;
+    display: inline-flex; align-items: center;
+    justify-content: center; font-size: 11px; font-weight: 700;
   }
-  .info-row:last-child .info-label,
-  .info-row:last-child .info-value {
-    border-bottom: none;
+  .checked { background: #333; color: #fff; }
+  .asset-bar {
+    border: 1.5px solid #000; border-bottom: none;
+    display: flex; align-items: center; padding: 5px 14px; gap: 12px;
   }
-  /* ── EULA ── */
-  .eula-box {
-    border: 1px solid #E0E6EF;
-    border-radius: 8px;
-    padding: 14px 16px;
-    background: #F5F7FA;
-    font-size: 12.5px;
-    line-height: 1.8;
-    color: #0D1B2A;
+  .asset-bar .label { font-weight: 700; font-size: 13px; }
+  .asset-bar .value { font-weight: 700; font-size: 15px; letter-spacing: 0.5px; }
+  .details-header {
+    background: #555; color: #fff; text-align: center;
+    font-weight: 700; font-size: 14px; padding: 5px;
+    border: 1.5px solid #000; border-bottom: none; letter-spacing: 0.5px;
   }
-  .eula-box p { margin-bottom: 6px; }
-  .eula-box p:last-child { margin-bottom: 0; }
-  /* ── Signature ── */
-  .sig-section {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-    margin-top: 4px;
+  .details-body { border: 1.5px solid #000; padding: 10px 14px 14px; }
+  .field-row {
+    display: flex; align-items: baseline;
+    margin-bottom: 9px; gap: 8px;
   }
-  .sig-box {
-    border: 1px solid #E0E6EF;
-    border-radius: 8px;
-    overflow: hidden;
+  .field-row:last-child { margin-bottom: 0; }
+  .field-label { font-weight: 600; min-width: 110px; font-size: 13px; flex-shrink: 0; }
+  .field-value {
+    flex: 1; border-bottom: 1px solid #888;
+    padding-bottom: 1px; font-size: 13px; min-width: 80px;
   }
-  .sig-box-label {
-    background: #F5F7FA;
-    padding: 7px 14px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.8px;
-    color: #607080;
-    text-transform: uppercase;
+  .remark {
+    border: 1.5px solid #000; border-top: none;
+    padding: 10px 14px; font-size: 12px; line-height: 1.7;
   }
-  .sig-box-content {
-    padding: 10px 14px;
-    min-height: 90px;
-    background: #fff;
+  .sig-table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+  .sig-table th {
+    background: #ddd; border: 1.5px solid #000;
+    padding: 7px 12px; font-weight: 700; font-size: 13px; text-align: center;
   }
-  .sig-box-content img {
-    max-width: 100%;
-    max-height: 80px;
-    display: block;
+  .sig-table td {
+    border: 1.5px solid #000; padding: 8px 12px;
+    font-size: 13px; vertical-align: top;
   }
-  .sig-name {
-    font-size: 13px;
-    font-weight: 600;
-    margin-top: 6px;
-    border-top: 1px solid #E0E6EF;
-    padding-top: 6px;
-    color: #0D1B2A;
+  .sig-img { max-height: 70px; max-width: 100%; display: block; }
+  .sig-name { font-weight: 600; font-size: 13px; margin-top: 6px; border-top: 1px solid #ccc; padding-top: 4px; }
+  .sig-date { font-size: 11px; color: #555; margin-top: 2px; }
+  .verify-box {
+    margin-top: 16px; border: 1.5px solid #000;
+    display: flex; align-items: stretch;
   }
-  .sig-date {
-    font-size: 11px;
-    color: #607080;
-    margin-top: 2px;
+  .verify-qr {
+    padding: 12px; border-right: 1.5px solid #000;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; min-width: 120px;
   }
-  /* ── Footer ── */
+  .verify-qr img { width: 90px; height: 90px; }
+  .verify-qr-label { font-size: 9px; color: #555; margin-top: 4px; text-align: center; }
+  .verify-info { padding: 12px; flex: 1; }
+  .verify-title {
+    font-size: 10px; font-weight: 700; letter-spacing: 1px;
+    color: #555; margin-bottom: 8px; text-transform: uppercase;
+  }
+  .verify-code {
+    font-family: monospace; font-size: 18px; font-weight: 700;
+    letter-spacing: 4px; color: #000; margin-bottom: 8px;
+  }
+  .verify-desc { font-size: 11px; color: #555; line-height: 1.6; }
+  .verify-meta {
+    margin-top: 8px; padding: 6px 10px;
+    background: #f5f5f5; border-radius: 4px;
+    font-size: 10px; color: #333; font-family: monospace;
+  }
   .footer {
-    margin-top: 24px;
-    padding-top: 12px;
-    border-top: 1px solid #E0E6EF;
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
-    color: #607080;
+    margin-top: 16px; font-size: 10px;
+    color: #888; text-align: right;
   }
   @media print {
-    body { padding: 20px; }
+    body { padding: 16px 24px; }
     .no-print { display: none; }
   }
 </style>
 </head>
 <body>
 
-<!-- ── Header ─────────────────────────────────────────── -->
+<!-- Header -->
 <div class="header">
-  <div class="header-left">
-    <h1>แบบฟอร์ม${isCheckOut ? 'เบิก' : 'คืน'}อุปกรณ์</h1>
-    <div class="subtitle">มหาวิทยาลัยเทคโนโลยีพระจอมเกล้าพระนครเหนือ (KMUTNB) — กองเทคโนโลยีสารสนเทศ</div>
+  <div>$logoTag</div>
+  <div class="header-center">
+    <div class="company">Stream I.T. Consulting Ltd.</div>
+    <div class="form-title">ASSETS PROFILE</div>
   </div>
-  <span class="badge">$action</span>
+  <div class="header-right">ASSET PROFILE REV : 04 (22/02/65)</div>
 </div>
 
-<!-- ── รายละเอียดอุปกรณ์ ─────────────────────────────── -->
-<div class="section">
-  <div class="section-title">รายละเอียดอุปกรณ์</div>
-  <div class="info-grid">
-    <div class="info-row">
-      <div class="info-label">Asset Tag</div>
-      <div class="info-value">$tag</div>
-    </div>
-    <div class="info-row">
-      <div class="info-label">ชื่ออุปกรณ์</div>
-      <div class="info-value">$name</div>
-    </div>
-    <div class="info-row">
-      <div class="info-label">ยี่ห้อ</div>
-      <div class="info-value">$manufacturer</div>
-    </div>
-    <div class="info-row">
-      <div class="info-label">รุ่น</div>
-      <div class="info-value">$model</div>
-    </div>
-    <div class="info-row">
-      <div class="info-label">Serial Number</div>
-      <div class="info-value">$serial</div>
-    </div>
-    <div class="info-row">
-      <div class="info-label">สถานะ</div>
-      <div class="info-value">$status</div>
-    </div>
-  </div>
+<!-- Device type -->
+<div class="type-row">
+  <label><div class="checkbox checked">&#10003;</div> NoteBook</label>
+  <label><div class="checkbox"></div> PC</label>
+  <label><div class="checkbox"></div> Server</label>
 </div>
 
-<!-- ── รายละเอียดการ${isCheckOut ? 'เบิก' : 'คืน'} ──── -->
-<div class="section">
-  <div class="section-title">รายละเอียดการ${isCheckOut ? 'เบิก' : 'คืน'}</div>
-  <div class="info-grid">
-    <div class="info-row">
-      <div class="info-label">${isCheckOut ? 'ผู้รับอุปกรณ์' : 'ผู้คืนอุปกรณ์'}</div>
-      <div class="info-value">$assigneeName</div>
-    </div>
-    <div class="info-row">
-      <div class="info-label">วันที่และเวลา</div>
-      <div class="info-value">$dateStr</div>
-    </div>
-  </div>
+<!-- Asset number -->
+<div class="asset-bar">
+  <span class="label">Asset Number :</span>
+  <span class="value">$tag</span>
 </div>
 
-<!-- ── ข้อตกลงการใช้งาน (EULA) ──────────────────────── -->
-<div class="section">
-  <div class="section-title">ข้อตกลงและเงื่อนไขการใช้อุปกรณ์</div>
-  <div class="eula-box">
-    <p><strong>1. การใช้งาน:</strong> ผู้รับอุปกรณ์ตกลงใช้อุปกรณ์เพื่อวัตถุประสงค์ของมหาวิทยาลัยเท่านั้น ห้ามใช้เพื่อประโยชน์ส่วนตัวหรือกิจกรรมที่ผิดกฎหมาย</p>
-    <p><strong>2. การดูแลรักษา:</strong> ผู้รับอุปกรณ์มีหน้าที่ดูแลรักษาอุปกรณ์ให้อยู่ในสภาพดี และต้องแจ้งทันทีหากอุปกรณ์ชำรุดหรือสูญหาย</p>
-    <p><strong>3. การรักษาความปลอดภัย:</strong> ห้ามติดตั้งซอฟต์แวร์ที่ไม่ได้รับอนุญาต และต้องปฏิบัติตามนโยบายความปลอดภัยสารสนเทศของมหาวิทยาลัย</p>
-    <p><strong>4. ความรับผิดชอบ:</strong> หากอุปกรณ์เสียหายหรือสูญหายอันเกิดจากความประมาทเลินเล่อ ผู้รับอุปกรณ์ต้องรับผิดชอบค่าใช้จ่ายในการซ่อมหรือเปลี่ยนทดแทน</p>
-    <p><strong>5. การคืนอุปกรณ์:</strong> ต้องคืนอุปกรณ์พร้อมอุปกรณ์เสริมครบถ้วนตามที่ระบุ เมื่อสิ้นสุดระยะเวลาการใช้งานหรือเมื่อได้รับการร้องขอ</p>
+<!-- Details header -->
+<div class="details-header">Details of Hardware</div>
+
+<!-- Details body -->
+<div class="details-body">
+  <div class="field-row">
+    <span class="field-label">Brand Name :</span>
+    <span class="field-value">$manufacturer</span>
+    <span class="field-label" style="min-width:55px;">Model :</span>
+    <span class="field-value">$model</span>
+  </div>
+  <div class="field-row">
+    <span class="field-label">S/N :</span>
+    <span class="field-value">$serial</span>
+    <span class="field-label" style="min-width:55px;">Name :</span>
+    <span class="field-value">$name</span>
+  </div>
+  <div class="field-row">
+    <span class="field-label">Harddisk :</span>
+    <span class="field-value">$storageType $capacity</span>
+    <span class="field-label" style="min-width:55px;">RAM :</span>
+    <span class="field-value">$ram</span>
+  </div>
+  <div class="field-row">
+    <span class="field-label">Monitor :</span>
+    <span class="field-value">$monitor</span>
+  </div>
+  <div class="field-row">
+    <span class="field-label">Action :</span>
+    <span class="field-value" style="font-weight:600;color:${isCheckOut ? '#1A73E8' : '#00C48C'};">$action</span>
+    <span class="field-label" style="min-width:55px;">Date :</span>
+    <span class="field-value">$dateStr</span>
   </div>
 </div>
 
-<!-- ── ลายเซ็น ─────────────────────────────────────── -->
-<div class="section">
-  <div class="section-title">ลายเซ็นยืนยัน</div>
-  <div class="sig-section">
-    <div class="sig-box">
-      <div class="sig-box-label">${isCheckOut ? 'ลายเซ็นผู้รับอุปกรณ์' : 'ลายเซ็นผู้คืนอุปกรณ์'}</div>
-      <div class="sig-box-content">
-        <img src="data:image/png;base64,$sigBase64" alt="signature">
+<!-- Remark -->
+<div class="remark">
+  <strong>Remark:</strong> The employee acknowledges that the Hardware received is the property of Stream I.T. Consulting Ltd.
+  The employee agrees to take care of and maintain the Hardware and a standard no lower than that which a person,
+  in general, would be expected to maintain. The hardware is possessed by the employee for work only.<br>
+  <strong>หมายเหตุ:</strong> พนักงานยอมรับทราบว่าฮาร์ดแวร์ที่ได้รับเป็นกรรมสิทธิ์ของบริษัท พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา
+  โดยฮาร์ดแวร์ที่ได้รับนี้พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น
+</div>
+
+<!-- Signature table -->
+<table class="sig-table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Division</th>
+      <th>Received Date / Signature</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="min-width:160px;">
+        <div style="padding-top:4px; font-weight:600;">$assigneeName</div>
+      </td>
+      <td style="min-width:100px;">
+        <div style="padding-top:4px;">$division</div>
+      </td>
+      <td style="min-width:220px;">
+        <img class="sig-img" src="data:image/png;base64,$sigBase64" alt="signature">
         <div class="sig-name">$assigneeName</div>
-        <div class="sig-date">วันที่: $dateStr</div>
-      </div>
+        <div class="sig-date">$dateStr</div>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- Verification -->
+<div class="verify-box">
+  <div class="verify-qr">
+    <img src="data:image/svg+xml;base64,$qrBase64" alt="QR">
+    <div class="verify-qr-label">Scan to verify</div>
+  </div>
+  <div class="verify-info">
+    <div class="verify-title">Document Verification</div>
+    <div class="verify-code">$verifyCode</div>
+    <div class="verify-desc">
+      This code is generated from asset tag, recipient name, date and signature fingerprint.<br>
+      Any modification to this document will invalidate this code.
     </div>
-    <div class="sig-box">
-      <div class="sig-box-label">ลายเซ็นผู้มอบ / เจ้าหน้าที่</div>
-      <div class="sig-box-content">
-        <div style="height:60px;border-bottom:1px solid #E0E6EF;"></div>
-        <div class="sig-name">ชื่อ: .........................................</div>
-        <div class="sig-date">วันที่: .........................................</div>
-      </div>
+    <div class="verify-meta">
+      ASSET: $tag &nbsp;|&nbsp; ACTION: $action &nbsp;|&nbsp; DATE: $dateStr &nbsp;|&nbsp; S/N: $serial
     </div>
   </div>
 </div>
 
-<!-- ── Footer ─────────────────────────────────────────── -->
-<div class="footer">
-  <span>เอกสารนี้สร้างโดยระบบ IT Asset Manager — KMUTNB</span>
-  <span>$dateStr</span>
-</div>
+<div class="footer">Generated by IT Asset Manager — Stream I.T. Consulting Ltd.</div>
 
-<!-- ── Print button (ไม่แสดงตอน print) ────────────────── -->
-<div class="no-print" style="margin-top:24px;text-align:center;">
+<!-- Print button -->
+<div class="no-print" style="margin-top:20px; text-align:center;">
   <button onclick="window.print()" style="
-    padding:10px 32px;
-    background:#1A73E8;
-    color:#fff;
-    border:none;
-    border-radius:8px;
-    font-size:15px;
-    font-family:'Sarabun',sans-serif;
-    font-weight:600;
-    cursor:pointer;
-    margin-right:12px;
-  ">🖨️ พิมพ์ / Save as PDF</button>
+    padding:10px 32px; background:#1A73E8; color:#fff;
+    border:none; border-radius:8px; font-size:14px;
+    font-family:'Sarabun',sans-serif; font-weight:600;
+    cursor:pointer; margin-right:12px;">
+    Print / Save as PDF
+  </button>
   <button onclick="window.close()" style="
-    padding:10px 24px;
-    background:#fff;
-    color:#607080;
-    border:1px solid #E0E6EF;
-    border-radius:8px;
-    font-size:15px;
-    font-family:'Sarabun',sans-serif;
-    cursor:pointer;
-  ">ปิด</button>
+    padding:10px 24px; background:#fff; color:#607080;
+    border:1px solid #ccc; border-radius:8px; font-size:14px;
+    font-family:'Sarabun',sans-serif; cursor:pointer;">
+    Close
+  </button>
 </div>
 
 </body>
 </html>''';
   }
+
+  // ── Download HTML file ─────────────────────────────────────────────────────
 
   void _downloadHtmlFile(String htmlContent, String action, DateTime now) {
     try {
@@ -515,8 +613,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       final min = now.minute.toString().padLeft(2, '0');
       final filename = '${action}_${now.year}$mm${dd}_$hh$min.html';
 
-      // ใช้ universal_html สำหรับ Web download
-      final bytes = htmlContent.codeUnits;
+      final bytes = utf8.encode(htmlContent);
       final blob = html.Blob(
         [Uint8List.fromList(bytes)],
         'text/html;charset=utf-8',
@@ -531,14 +628,15 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       html.document.body!.append(anchor);
       anchor.click();
       anchor.remove();
-
       html.Url.revokeObjectUrl(url);
+
       debugPrint('=== [Download] success: $filename');
     } catch (e) {
       debugPrint('=== [Download] error: $e');
     }
   }
 
+  // ── Build UI ───────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -549,7 +647,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── Header ──────────────────────────────────────────────────────
+          // ── Header (fixed) ──────────────────────────────────────────────
           Container(
             padding: const EdgeInsets.fromLTRB(20, 20, 12, 16),
             decoration: const BoxDecoration(
@@ -587,143 +685,218 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             ),
           ),
 
-          // ── Info ─────────────────────────────────────────────────────────
-          if (widget.asset != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: AppConstants.accentBlue.withOpacity(0.06),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                      color: AppConstants.accentBlue.withOpacity(0.2)),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(children: [
-                      const Icon(Icons.laptop_mac,
-                          size: 14, color: AppConstants.accentBlue),
-                      const SizedBox(width: 6),
-                      Text(
-                        widget.asset!.name ??
-                            widget.asset!.assetTag ??
-                            'Asset',
-                        style: const TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: AppConstants.textPrimary),
-                      ),
-                    ]),
-                    const SizedBox(height: 4),
-                    Text(
-                      'S/N: ${widget.asset!.serial ?? '—'}  |  Tag: ${widget.asset!.assetTag ?? '—'}',
-                      style: const TextStyle(
-                          fontSize: 11, color: AppConstants.textSecondary),
-                    ),
-                    if (widget.assigneeName != null) ...[
-                      const SizedBox(height: 4),
-                      Text(
-                        '${widget.isCheckOut ? 'ผู้รับ' : 'ผู้คืน'}: ${widget.assigneeName}',
-                        style: const TextStyle(
-                            fontSize: 11, color: AppConstants.textSecondary),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-
-          // ── Instruction ──────────────────────────────────────────────────
-          const Padding(
-            padding: EdgeInsets.fromLTRB(20, 12, 20, 6),
-            child: Text(
-              'เซ็นชื่อในกล่องด้านล่าง',
-              style: TextStyle(
-                  color: AppConstants.textSecondary, fontSize: 13),
-            ),
-          ),
-
-          // ── Error banner ─────────────────────────────────────────────────
-          if (_exportError != null)
-            Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: AppConstants.accentRed.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                      color: AppConstants.accentRed.withOpacity(0.4)),
-                ),
-                child: Text(_exportError!,
-                    style: const TextStyle(
-                        color: AppConstants.accentRed, fontSize: 12)),
-              ),
-            ),
-
-          // ── Signature canvas ─────────────────────────────────────────────
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Container(
-              height: 220,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                border: Border.all(
-                  color: _isEmpty
-                      ? AppConstants.divider
-                      : AppConstants.accentBlue,
-                  width: _isEmpty ? 1.5 : 2,
-                ),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              clipBehavior: Clip.hardEdge,
-              child: Stack(
+          // ── Scrollable content ──────────────────────────────────────────
+          Flexible(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Signature(
-                    controller: _controller,
-                    backgroundColor: Colors.white,
-                  ),
-                  Positioned(
-                    bottom: 36,
-                    left: 24,
-                    right: 24,
-                    child: Container(
-                        height: 1, color: AppConstants.divider),
-                  ),
-                  if (_isEmpty)
-                    const Center(
-                      child: Text('เซ็นชื่อที่นี่',
-                          style: TextStyle(
-                              color: AppConstants.divider,
-                              fontSize: 16,
-                              fontWeight: FontWeight.w300)),
+                  // ── Asset info ──────────────────────────────────────────
+                  if (widget.asset != null)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: AppConstants.accentBlue.withOpacity(0.06),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                              color:
+                                  AppConstants.accentBlue.withOpacity(0.2)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(children: [
+                              const Icon(Icons.laptop_mac,
+                                  size: 14,
+                                  color: AppConstants.accentBlue),
+                              const SizedBox(width: 6),
+                              Text(
+                                widget.asset!.name ??
+                                    widget.asset!.assetTag ??
+                                    'Asset',
+                                style: const TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: AppConstants.textPrimary),
+                              ),
+                            ]),
+                            const SizedBox(height: 4),
+                            Text(
+                              'S/N: ${widget.asset!.serial ?? '—'}  |  Tag: ${widget.asset!.assetTag ?? '—'}',
+                              style: const TextStyle(
+                                  fontSize: 11,
+                                  color: AppConstants.textSecondary),
+                            ),
+                            if (widget.assigneeName != null) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                '${widget.isCheckOut ? 'Recipient' : 'Returned by'}: ${widget.assigneeName}'
+                                '${widget.division != null ? ' (${widget.division})' : ''}',
+                                style: const TextStyle(
+                                    fontSize: 11,
+                                    color: AppConstants.textSecondary),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
                     ),
+
+                  // ── Remark / ข้อตกลง (checkout only) ────────────────────
+                  if (widget.isCheckOut)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color:
+                              AppConstants.accentAmber.withOpacity(0.07),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                              color: AppConstants.accentAmber
+                                  .withOpacity(0.4)),
+                        ),
+                        child: const Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(children: [
+                              Icon(Icons.info_outline,
+                                  size: 14,
+                                  color: AppConstants.accentAmber),
+                              SizedBox(width: 6),
+                              Text(
+                                'ข้อตกลงการรับอุปกรณ์',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                    color: AppConstants.accentAmber),
+                              ),
+                            ]),
+                            SizedBox(height: 6),
+                            Text(
+                              'Remark: The employee acknowledges that the Hardware received is the property of Stream I.T. Consulting Ltd. '
+                              'The employee agrees to take care of and maintain the Hardware and a standard no lower than that which a person, '
+                              'in general, would be expected to maintain. The hardware is possessed by the employee for work only.',
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: AppConstants.textPrimary,
+                                  height: 1.5),
+                            ),
+                            SizedBox(height: 6),
+                            Text(
+                              'หมายเหตุ: พนักงานยอมรับทราบว่าฮาร์ดแวร์ที่ได้รับเป็นกรรมสิทธิ์ของบริษัท '
+                              'พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา'
+                              'โดยฮาร์ดแวร์ที่ได้รับนี้พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น',
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: AppConstants.textPrimary,
+                                  height: 1.5),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  // ── Instruction ─────────────────────────────────────────
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(20, 12, 20, 6),
+                    child: Text(
+                      'Sign in the box below',
+                      style: TextStyle(
+                          color: AppConstants.textSecondary, fontSize: 13),
+                    ),
+                  ),
+
+                  // ── Error banner ────────────────────────────────────────
+                  if (_exportError != null)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 4),
+                      child: Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: AppConstants.accentRed.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                              color:
+                                  AppConstants.accentRed.withOpacity(0.4)),
+                        ),
+                        child: Text(_exportError!,
+                            style: const TextStyle(
+                                color: AppConstants.accentRed,
+                                fontSize: 12)),
+                      ),
+                    ),
+
+                  // ── Signature canvas ────────────────────────────────────
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Container(
+                      height: 220,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        border: Border.all(
+                          color: _isEmpty
+                              ? AppConstants.divider
+                              : AppConstants.accentBlue,
+                          width: _isEmpty ? 1.5 : 2,
+                        ),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      clipBehavior: Clip.hardEdge,
+                      child: Stack(
+                        children: [
+                          Signature(
+                            controller: _controller,
+                            backgroundColor: Colors.white,
+                          ),
+                          Positioned(
+                            bottom: 36,
+                            left: 24,
+                            right: 24,
+                            child: Container(
+                                height: 1,
+                                color: AppConstants.divider),
+                          ),
+                          if (_isEmpty)
+                            const Center(
+                              child: Text('Sign here',
+                                  style: TextStyle(
+                                      color: AppConstants.divider,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w300)),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  // ── Note ────────────────────────────────────────────────
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
+                    child: Row(
+                      children: [
+                        Icon(Icons.verified_outlined,
+                            size: 13,
+                            color: AppConstants.textSecondary),
+                        SizedBox(width: 5),
+                        Text(
+                          'Document includes QR code & verification code',
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: AppConstants.textSecondary),
+                        ),
+                      ],
+                    ),
+                  ),
                 ],
               ),
             ),
           ),
 
-          // ── Note ─────────────────────────────────────────────────────────
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
-            child: Row(
-              children: [
-                Icon(Icons.download_outlined,
-                    size: 13, color: AppConstants.textSecondary),
-                SizedBox(width: 5),
-                Text(
-                  'กด "ยืนยัน" เพื่อดาวน์โหลดเอกสาร PDF A4',
-                  style: TextStyle(
-                      fontSize: 11, color: AppConstants.textSecondary),
-                ),
-              ],
-            ),
-          ),
-
-          // ── Actions ───────────────────────────────────────────────────────
+          // ── Actions (fixed) ─────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
             child: Row(
@@ -737,24 +910,16 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                     });
                   },
                   icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('ล้าง'),
+                  label: const Text('Clear'),
                   style: OutlinedButton.styleFrom(
                     foregroundColor: AppConstants.textSecondary,
                     side: const BorderSide(color: AppConstants.divider),
                   ),
                 ),
                 const Spacer(),
-                TextButton(
-                  onPressed: _isExporting
-                      ? null
-                      : () => Navigator.of(context).pop(Uint8List(0)),
-                  child: const Text('ข้าม',
-                      style:
-                          TextStyle(color: AppConstants.textSecondary)),
-                ),
-                const SizedBox(width: 8),
                 ElevatedButton.icon(
-                  onPressed: (!_isEmpty && !_isExporting) ? _confirm : null,
+                  onPressed:
+                      (!_isEmpty && !_isExporting) ? _confirm : null,
                   icon: _isExporting
                       ? const SizedBox(
                           width: 16,
@@ -762,8 +927,9 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                           child: CircularProgressIndicator(
                               strokeWidth: 2, color: Colors.white))
                       : const Icon(Icons.download_outlined, size: 18),
-                  label: Text(
-                      _isExporting ? 'กำลังสร้างเอกสาร…' : 'ยืนยัน & ดาวน์โหลด'),
+                  label: Text(_isExporting
+                      ? 'Generating…'
+                      : 'Confirm & Download'),
                 ),
               ],
             ),

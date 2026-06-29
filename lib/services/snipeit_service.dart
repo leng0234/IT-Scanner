@@ -183,6 +183,19 @@ class SnipeITService {
 
   // ── Users ──────────────────────────────────────────────────────────────────
 
+  /// ดึงข้อมูล user เต็ม (รวม department) จาก id
+  Future<AssetUser?> getUserById(int id) async {
+    try {
+      final response = await _dio.get('users/$id');
+      final data = response.data as Map<String, dynamic>;
+      if (data['id'] == null) return null;
+      return AssetUser.fromJson(data);
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 404) return null;
+      rethrow;
+    }
+  }
+
   Future<List<AssetUser>> searchUsers(String query) async {
     final response = await _dio.get(
       'users',
@@ -270,6 +283,46 @@ class SnipeITService {
 
     final ok = response.data?['status'] == 'success';
     print('=== [Upload] success=$ok');
+    return ok;
+  }
+
+  // ── Upload Signature to User ───────────────────────────────────────────────
+
+  /// Upload signature PNG ไปยัง Files ของ User (tab 📎 ใน Snipe-IT)
+  /// Endpoint: POST /api/v1/users/{id}/uploads
+  Future<bool> uploadSignatureToUser({
+    required int userId,
+    required Uint8List pngBytes,
+    String filename = 'signature.png',
+  }) async {
+    print('=== [Upload User] START userId=$userId bytes=${pngBytes.length}');
+
+    final formData = FormData.fromMap({
+      'file': MultipartFile.fromBytes(
+        pngBytes,
+        filename: filename,
+        contentType: DioMediaType('image', 'png'),
+      ),
+    });
+
+    final uploadDio = Dio(BaseOptions(
+      baseUrl: '$_baseUrl/api/v1/',
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(seconds: 30),
+      headers: {
+        'Authorization': 'Bearer $_token',
+        'Accept': 'application/json',
+      },
+    ));
+
+    final response = await uploadDio.post(
+      'users/$userId/uploads',
+      data: formData,
+    );
+
+    print('=== [Upload User] status=${response.statusCode} data=${response.data}');
+    final ok = response.data?['status'] == 'success';
+    print('=== [Upload User] success=$ok');
     return ok;
   }
 
