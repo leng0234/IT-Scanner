@@ -4,6 +4,9 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
 import 'package:qr/qr.dart';
 import 'package:signature/signature.dart';
 import 'package:universal_html/html.dart' as html;
@@ -79,6 +82,30 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     super.dispose();
   }
 
+  // ── HTML entity decoder ────────────────────────────────────────────────────
+
+  String _decodeHtmlEntities(String input) {
+    return input
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#34;', '"')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&#38;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&#60;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&#62;', '>')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&#39;', "'")
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&#160;', ' ')
+        .replaceAll('&ldquo;', '\u201C')
+        .replaceAll('&rdquo;', '\u201D')
+        .replaceAll('&lsquo;', '\u2018')
+        .replaceAll('&rsquo;', '\u2019')
+        .replaceAll('&ndash;', '\u2013')
+        .replaceAll('&mdash;', '\u2014');
+  }
+
   // ── Export signature PNG ───────────────────────────────────────────────────
 
   Future<Uint8List?> _exportSignatureBytes() async {
@@ -118,8 +145,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         }
         final picture = recorder.endRecording();
         final img = await picture.toImage(w.toInt(), h.toInt());
-        final byteData =
-            await img.toByteData(format: ui.ImageByteFormat.png);
+        final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
         pngBytes = byteData?.buffer.asUint8List();
       } catch (_) {}
     }
@@ -129,7 +155,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
 
   // ── Verification helpers ───────────────────────────────────────────────────
 
-  /// FNV-1a 32-bit hash (JS-safe)
   String _generateHash(String data) {
     final bytes = utf8.encode(data);
     var hash = 0x811c9dc5;
@@ -151,46 +176,67 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         .take(32)
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join();
-
-    final payload =
-        '$assetTag|$assigneeName|$dateStr|$action|$sigFingerprint';
+    final payload = '$assetTag|$assigneeName|$dateStr|$action|$sigFingerprint';
     final hash = _generateHash(payload);
-
     final nameHash = _generateHash(assigneeName);
     return '${hash.substring(0, 4)}-${hash.substring(4, 8)}-'
             '${nameHash.substring(0, 4)}-${nameHash.substring(4, 8)}'
         .toUpperCase();
   }
 
-  /// Generate QR SVG from string data (uses package qr)
-  String _generateQrSvg(String data) {
+  // ── QR PNG via dart:ui canvas ──────────────────────────────────────────────
+
+  Future<Uint8List> _generateQrPngBytes(String data) async {
     final qr = QrCode.fromData(
       data: data,
       errorCorrectLevel: QrErrorCorrectLevel.M,
     );
     final qrImage = QrImage(qr);
-    final size = qr.moduleCount;
-    const cellSize = 4;
-    const padding = 8;
-    final svgSize = size * cellSize + padding * 2;
+    final moduleCount = qr.moduleCount;
+    const cellSize = 6;
+    const padding = 12;
+    final totalSize = moduleCount * cellSize + padding * 2;
 
-    final sb = StringBuffer();
-    sb.write(
-        '<svg xmlns="http://www.w3.org/2000/svg" width="$svgSize" height="$svgSize">');
-    sb.write('<rect width="$svgSize" height="$svgSize" fill="white"/>');
-
-    for (var row = 0; row < size; row++) {
-      for (var col = 0; col < size; col++) {
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(
+      recorder,
+      Rect.fromLTWH(0, 0, totalSize.toDouble(), totalSize.toDouble()),
+    );
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, totalSize.toDouble(), totalSize.toDouble()),
+      Paint()..color = Colors.white,
+    );
+    final paint = Paint()..color = Colors.black;
+    for (var row = 0; row < moduleCount; row++) {
+      for (var col = 0; col < moduleCount; col++) {
         if (qrImage.isDark(row, col)) {
-          final x = col * cellSize + padding;
-          final y = row * cellSize + padding;
-          sb.write(
-              '<rect x="$x" y="$y" width="$cellSize" height="$cellSize" fill="black"/>');
+          canvas.drawRect(
+            Rect.fromLTWH(
+              (col * cellSize + padding).toDouble(),
+              (row * cellSize + padding).toDouble(),
+              cellSize.toDouble(),
+              cellSize.toDouble(),
+            ),
+            paint,
+          );
         }
       }
     }
-    sb.write('</svg>');
-    return sb.toString();
+    final picture = recorder.endRecording();
+    final img = await picture.toImage(totalSize, totalSize);
+    final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+    return byteData!.buffer.asUint8List();
+  }
+
+// ── Load font bytes from bundled asset ──────────────────────────────────────
+
+  Future<pw.Font?> _loadFontAsset(String assetPath) async {
+    try {
+      final data = await rootBundle.load(assetPath);
+      return pw.Font.ttf(data);
+    } catch (_) {
+      return null;
+    }
   }
 
   // ── Confirm ────────────────────────────────────────────────────────────────
@@ -214,7 +260,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       }
 
       if (widget.asset != null) {
-        await _generateAndDownloadHtml(pngBytes);
+        await _generateAndDownloadPdf(pngBytes);
       }
 
       if (mounted) Navigator.of(context).pop(pngBytes);
@@ -228,17 +274,15 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     }
   }
 
-  // ── Generate & download HTML ───────────────────────────────────────────────
+  // ── Generate & download PDF ────────────────────────────────────────────────
 
-  Future<void> _generateAndDownloadHtml(Uint8List sigBytes) async {
+  Future<void> _generateAndDownloadPdf(Uint8List sigBytes) async {
     final now = DateTime.now();
     final dateStr =
         '${now.day}/${now.month}/${now.year} ${now.hour}:${now.minute.toString().padLeft(2, '0')}';
     final asset = widget.asset!;
     final action = widget.isCheckOut ? 'Checkout' : 'Checkin';
-    final sigBase64 = _bytesToBase64(sigBytes);
 
-    // Generate verification code
     final verifyCode = _generateVerificationCode(
       assetTag: asset.assetTag ?? '—',
       assigneeName: widget.assigneeName ?? '—',
@@ -247,7 +291,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       sigBytes: sigBytes,
     );
 
-    // QR data
     final qrData = [
       'ASSET:${asset.assetTag ?? '—'}',
       'ACTION:$action',
@@ -258,366 +301,588 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       'VERIFY:$verifyCode',
     ].join('\n');
 
-    final qrSvg = _generateQrSvg(qrData);
-    final qrBase64 = base64.encode(utf8.encode(qrSvg));
+    final qrPngBytes = await _generateQrPngBytes(qrData);
 
-    // Load logo from assets
-    String logoBase64 = '';
+    // Logo
+    Uint8List? logoBytes;
     try {
-      final logoBytes = await rootBundle.load('assets/stream_logoNew.png');
-      logoBase64 = _bytesToBase64(logoBytes.buffer.asUint8List());
+      final data = await rootBundle.load('assets/stream_logoNew.png');
+      logoBytes = data.buffer.asUint8List();
     } catch (_) {}
 
-    final htmlContent = _buildHtml(
+// ── Load bundled Sarabun font (Thai + Latin support) ──────────────────
+    final sarabunRegular =
+        await _loadFontAsset('assets/fonts/Sarabun-Regular.ttf');
+    final sarabunBold = await _loadFontAsset('assets/fonts/Sarabun-Bold.ttf');
+
+    final pdfBytes = await _buildPdf(
       action: action,
       dateStr: dateStr,
       asset: asset,
       assigneeName: widget.assigneeName ?? '—',
       division: widget.division ?? '—',
-      sigBase64: sigBase64,
-      customFields: asset.customFields ?? {},
-      logoBase64: logoBase64,
+      sigBytes: sigBytes,
+      qrPngBytes: qrPngBytes,
+      logoBytes: logoBytes,
       verifyCode: verifyCode,
-      qrBase64: qrBase64,
+      sarabunRegular: sarabunRegular,
+      sarabunBold: sarabunBold,
     );
 
-    _downloadHtmlFile(htmlContent, action, now);
+    _downloadPdfFile(pdfBytes, action, now);
   }
 
-  // ── Base64 encoder ─────────────────────────────────────────────────────────
+  // ── Build PDF ──────────────────────────────────────────────────────────────
 
-  String _bytesToBase64(Uint8List bytes) {
-    const chars =
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    final result = StringBuffer();
-    var i = 0;
-    while (i < bytes.length) {
-      final b0 = bytes[i++];
-      final b1 = i < bytes.length ? bytes[i++] : 0;
-      final b2 = i < bytes.length ? bytes[i++] : 0;
-      result.write(chars[(b0 >> 2) & 0x3F]);
-      result.write(chars[((b0 << 4) | (b1 >> 4)) & 0x3F]);
-      result.write(chars[((b1 << 2) | (b2 >> 6)) & 0x3F]);
-      result.write(chars[b2 & 0x3F]);
-    }
-    final s = result.toString();
-    switch (bytes.length % 3) {
-      case 1:
-        return '${s.substring(0, s.length - 2)}==';
-      case 2:
-        return '${s.substring(0, s.length - 1)}=';
-      default:
-        return s;
-    }
-  }
-
-  // ── Build HTML ─────────────────────────────────────────────────────────────
-
-  String _buildHtml({
+  Future<Uint8List> _buildPdf({
     required String action,
     required String dateStr,
     required AssetModel asset,
     required String assigneeName,
     required String division,
-    required String sigBase64,
-    Map<String, dynamic> customFields = const {},
-    String logoBase64 = '',
+    required Uint8List sigBytes,
+    required Uint8List qrPngBytes,
+    Uint8List? logoBytes,
     String verifyCode = '',
-    String qrBase64 = '',
-  }) {
+    pw.Font? sarabunRegular,
+    pw.Font? sarabunBold,
+  }) async {
+    // ── Fix: decode HTML entities from custom field values ─────────────────
     String getField(String key) {
-      final field = customFields[key];
+      final field = (asset.customFields ?? {})[key];
       if (field == null) return '—';
-      return field['value']?.toString() ?? '—';
+      final raw = field['value']?.toString() ?? '—';
+      return _decodeHtmlEntities(raw);
     }
 
     final tag = asset.assetTag ?? '—';
     final serial = asset.serial ?? '—';
-    final name = asset.name ?? asset.model?.name ?? '—';
-    final manufacturer = asset.manufacturer?.name ?? '—';
-    final model = asset.model?.name ?? '—';
+    final name = _decodeHtmlEntities(asset.name ?? asset.model?.name ?? '—');
+    final manufacturer = _decodeHtmlEntities(asset.manufacturer?.name ?? '—');
+    final model = _decodeHtmlEntities(asset.model?.name ?? '—');
     final ram = getField('RAM');
     final storageType = getField('Storage Type');
     final capacity = getField('Capacity');
     final monitor = getField('Monitor');
     final isCheckOut = widget.isCheckOut;
 
-    final logoTag = logoBase64.isNotEmpty
-        ? '<img src="data:image/png;base64,$logoBase64" alt="Logo" style="height:52px;">'
-        : '<div style="width:80px;"></div>';
+    // Colors
+    const grey555 = PdfColor.fromInt(0xFF555555);
+    const greyDDD = PdfColor.fromInt(0xFFDDDDDD);
+    const greyF0 = PdfColor.fromInt(0xFFF0F0F0);
+    const greyF5 = PdfColor.fromInt(0xFFF5F5F5);
+    const white = PdfColors.white;
+    const actionBlue = PdfColor.fromInt(0xFF1A73E8);
+    const actionGreen = PdfColor.fromInt(0xFF00C48C);
 
-    return '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Assets Profile — $tag</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&display=swap');
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: 'Sarabun', sans-serif;
-    font-size: 13px;
-    color: #000;
-    background: #fff;
-    padding: 32px 40px;
-    max-width: 794px;
-    margin: 0 auto;
-  }
-  .header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
-  }
-  .header-center { text-align: center; flex: 1; padding: 0 16px; }
-  .header-center .company { font-size: 15px; font-weight: 700; }
-  .header-center .form-title {
-    font-size: 17px; font-weight: 700;
-    letter-spacing: 1px; margin-top: 2px;
-  }
-  .header-right { text-align: right; font-size: 11px; color: #555; }
-  .type-row {
-    display: flex; align-items: center; gap: 24px;
-    border: 1.5px solid #000; border-bottom: none;
-    padding: 6px 14px; background: #f0f0f0;
-  }
-  .type-row label {
-    display: flex; align-items: center;
-    gap: 6px; font-weight: 600; font-size: 13px;
-  }
-  .checkbox {
-    width: 14px; height: 14px; border: 1.5px solid #000;
-    display: inline-flex; align-items: center;
-    justify-content: center; font-size: 11px; font-weight: 700;
-  }
-  .checked { background: #333; color: #fff; }
-  .asset-bar {
-    border: 1.5px solid #000; border-bottom: none;
-    display: flex; align-items: center; padding: 5px 14px; gap: 12px;
-  }
-  .asset-bar .label { font-weight: 700; font-size: 13px; }
-  .asset-bar .value { font-weight: 700; font-size: 15px; letter-spacing: 0.5px; }
-  .details-header {
-    background: #555; color: #fff; text-align: center;
-    font-weight: 700; font-size: 14px; padding: 5px;
-    border: 1.5px solid #000; border-bottom: none; letter-spacing: 0.5px;
-  }
-  .details-body { border: 1.5px solid #000; padding: 10px 14px 14px; }
-  .field-row {
-    display: flex; align-items: baseline;
-    margin-bottom: 9px; gap: 8px;
-  }
-  .field-row:last-child { margin-bottom: 0; }
-  .field-label { font-weight: 600; min-width: 110px; font-size: 13px; flex-shrink: 0; }
-  .field-value {
-    flex: 1; border-bottom: 1px solid #888;
-    padding-bottom: 1px; font-size: 13px; min-width: 80px;
-  }
-  .remark {
-    border: 1.5px solid #000; border-top: none;
-    padding: 10px 14px; font-size: 12px; line-height: 1.7;
-  }
-  .sig-table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-  .sig-table th {
-    background: #ddd; border: 1.5px solid #000;
-    padding: 7px 12px; font-weight: 700; font-size: 13px; text-align: center;
-  }
-  .sig-table td {
-    border: 1.5px solid #000; padding: 8px 12px;
-    font-size: 13px; vertical-align: top;
-  }
-  .sig-img { max-height: 70px; max-width: 100%; display: block; }
-  .sig-name { font-weight: 600; font-size: 13px; margin-top: 6px; border-top: 1px solid #ccc; padding-top: 4px; }
-  .sig-date { font-size: 11px; color: #555; margin-top: 2px; }
-  .verify-box {
-    margin-top: 16px; border: 1.5px solid #000;
-    display: flex; align-items: stretch;
-  }
-  .verify-qr {
-    padding: 12px; border-right: 1.5px solid #000;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center; min-width: 120px;
-  }
-  .verify-qr img { width: 90px; height: 90px; }
-  .verify-qr-label { font-size: 9px; color: #555; margin-top: 4px; text-align: center; }
-  .verify-info { padding: 12px; flex: 1; }
-  .verify-title {
-    font-size: 10px; font-weight: 700; letter-spacing: 1px;
-    color: #555; margin-bottom: 8px; text-transform: uppercase;
-  }
-  .verify-code {
-    font-family: monospace; font-size: 18px; font-weight: 700;
-    letter-spacing: 4px; color: #000; margin-bottom: 8px;
-  }
-  .verify-desc { font-size: 11px; color: #555; line-height: 1.6; }
-  .verify-meta {
-    margin-top: 8px; padding: 6px 10px;
-    background: #f5f5f5; border-radius: 4px;
-    font-size: 10px; color: #333; font-family: monospace;
-  }
-  .footer {
-    margin-top: 16px; font-size: 10px;
-    color: #888; text-align: right;
-  }
-  @media print {
-    body { padding: 16px 24px; }
-    .no-print { display: none; }
-  }
-</style>
-</head>
-<body>
+    // ── Fonts ──────────────────────────────────────────────────────────────
+    // Use Sarabun when available (Thai + Latin). Fall back to Helvetica only
+    // for Latin-only content when Sarabun failed to load.
+    final baseFont = sarabunRegular ?? pw.Font.helvetica();
+    final boldFont = sarabunBold ?? pw.Font.helveticaBold();
 
-<!-- Header -->
-<div class="header">
-  <div>$logoTag</div>
-  <div class="header-center">
-    <div class="company">Stream I.T. Consulting Ltd.</div>
-    <div class="form-title">ASSETS PROFILE</div>
-  </div>
-  <div class="header-right">ASSET PROFILE REV : 04 (22/02/65)</div>
-</div>
+    pw.TextStyle ts({
+      double size = 10,
+      pw.Font? font,
+      PdfColor color = PdfColors.black,
+      double? lineSpacing,
+    }) =>
+        pw.TextStyle(
+          font: font ?? baseFont,
+          fontSize: size,
+          color: color,
+          lineSpacing: lineSpacing,
+        );
 
-<!-- Device type -->
-<div class="type-row">
-  <label><div class="checkbox checked">&#10003;</div> NoteBook</label>
-  <label><div class="checkbox"></div> PC</label>
-  <label><div class="checkbox"></div> Server</label>
-</div>
+    // ── Field row helper ───────────────────────────────────────────────────
+    pw.Widget fieldRow(
+      String label1,
+      String value1, {
+      String? label2,
+      String? value2,
+      double minW1 = 80,
+      double minW2 = 40,
+    }) {
+      final children = <pw.Widget>[
+        pw.SizedBox(
+          width: minW1,
+          child: pw.Text(label1, style: ts(font: boldFont)),
+        ),
+        pw.Expanded(
+          child: pw.Container(
+            decoration: const pw.BoxDecoration(
+              border: pw.Border(
+                bottom: pw.BorderSide(color: PdfColors.grey, width: 0.5),
+              ),
+            ),
+            padding: const pw.EdgeInsets.only(bottom: 1),
+            child: pw.Text(value1, style: ts()),
+          ),
+        ),
+      ];
+      if (label2 != null && value2 != null) {
+        children.addAll([
+          pw.SizedBox(width: 8),
+          pw.SizedBox(
+            width: minW2,
+            child: pw.Text(label2, style: ts(font: boldFont)),
+          ),
+          pw.Expanded(
+            child: pw.Container(
+              decoration: const pw.BoxDecoration(
+                border: pw.Border(
+                  bottom: pw.BorderSide(color: PdfColors.grey, width: 0.5),
+                ),
+              ),
+              padding: const pw.EdgeInsets.only(bottom: 1),
+              child: pw.Text(value2, style: ts()),
+            ),
+          ),
+        ]);
+      }
+      return pw.Padding(
+        padding: const pw.EdgeInsets.only(bottom: 6),
+        child: pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.end,
+          children: children,
+        ),
+      );
+    }
 
-<!-- Asset number -->
-<div class="asset-bar">
-  <span class="label">Asset Number :</span>
-  <span class="value">$tag</span>
-</div>
+    final doc = pw.Document();
 
-<!-- Details header -->
-<div class="details-header">Details of Hardware</div>
+    doc.addPage(
+      pw.Page(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.symmetric(horizontal: 40, vertical: 32),
+        build: (context) {
+          return pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            children: [
+              // ── Header ──────────────────────────────────────────────
+              pw.Row(
+                crossAxisAlignment: pw.CrossAxisAlignment.center,
+                children: [
+                  if (logoBytes != null)
+                    pw.Image(pw.MemoryImage(logoBytes), height: 40)
+                  else
+                    pw.SizedBox(width: 60),
+                  pw.Expanded(
+                    child: pw.Column(
+                      children: [
+                        pw.Text('Stream I.T. Consulting Ltd.',
+                            style: ts(size: 12, font: boldFont),
+                            textAlign: pw.TextAlign.center),
+                        pw.SizedBox(height: 2),
+                        pw.Text('ASSETS PROFILE',
+                            style: ts(size: 14, font: boldFont),
+                            textAlign: pw.TextAlign.center),
+                      ],
+                    ),
+                  ),
+                  pw.Text('ASSET PROFILE REV : 04 (22/02/65)',
+                      style: ts(size: 8, color: grey555)),
+                ],
+              ),
 
-<!-- Details body -->
-<div class="details-body">
-  <div class="field-row">
-    <span class="field-label">Brand Name :</span>
-    <span class="field-value">$manufacturer</span>
-    <span class="field-label" style="min-width:55px;">Model :</span>
-    <span class="field-value">$model</span>
-  </div>
-  <div class="field-row">
-    <span class="field-label">S/N :</span>
-    <span class="field-value">$serial</span>
-    <span class="field-label" style="min-width:55px;">Name :</span>
-    <span class="field-value">$name</span>
-  </div>
-  <div class="field-row">
-    <span class="field-label">Harddisk :</span>
-    <span class="field-value">$storageType $capacity</span>
-    <span class="field-label" style="min-width:55px;">RAM :</span>
-    <span class="field-value">$ram</span>
-  </div>
-  <div class="field-row">
-    <span class="field-label">Monitor :</span>
-    <span class="field-value">$monitor</span>
-  </div>
-  <div class="field-row">
-    <span class="field-label">Action :</span>
-    <span class="field-value" style="font-weight:600;color:${isCheckOut ? '#1A73E8' : '#00C48C'};">$action</span>
-    <span class="field-label" style="min-width:55px;">Date :</span>
-    <span class="field-value">$dateStr</span>
-  </div>
-</div>
+              pw.SizedBox(height: 8),
 
-<!-- Remark -->
-<div class="remark">
-  <strong>Remark:</strong> The employee acknowledges that the Hardware received is the property of Stream I.T. Consulting Ltd.
-  The employee agrees to take care of and maintain the Hardware and a standard no lower than that which a person,
-  in general, would be expected to maintain. The hardware is possessed by the employee for work only.<br>
-  <strong>หมายเหตุ:</strong> พนักงานยอมรับทราบว่าฮาร์ดแวร์ที่ได้รับเป็นกรรมสิทธิ์ของบริษัท พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา
-  โดยฮาร์ดแวร์ที่ได้รับนี้พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น
-</div>
+              // ── Device type checkboxes ───────────────────────────────
+              pw.Container(
+                padding:
+                    const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                decoration: pw.BoxDecoration(
+                  color: greyF0,
+                  border: pw.Border.all(width: 1.5),
+                ),
+                child: pw.Row(
+                  children: [
+                    _pdfCheckbox('NoteBook',
+                        checked: true, baseFont: baseFont, boldFont: boldFont),
+                    pw.SizedBox(width: 20),
+                    _pdfCheckbox('PC', baseFont: baseFont, boldFont: boldFont),
+                    pw.SizedBox(width: 20),
+                    _pdfCheckbox('Server',
+                        baseFont: baseFont, boldFont: boldFont),
+                  ],
+                ),
+              ),
 
-<!-- Signature table -->
-<table class="sig-table">
-  <thead>
-    <tr>
-      <th>Name</th>
-      <th>Division</th>
-      <th>Received Date / Signature</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style="min-width:160px;">
-        <div style="padding-top:4px; font-weight:600;">$assigneeName</div>
-      </td>
-      <td style="min-width:100px;">
-        <div style="padding-top:4px;">$division</div>
-      </td>
-      <td style="min-width:220px;">
-        <img class="sig-img" src="data:image/png;base64,$sigBase64" alt="signature">
-        <div class="sig-name">$assigneeName</div>
-        <div class="sig-date">$dateStr</div>
-      </td>
-    </tr>
-  </tbody>
-</table>
+              // ── Asset number ─────────────────────────────────────────
+              pw.Container(
+                padding:
+                    const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                decoration: const pw.BoxDecoration(
+                  border: pw.Border(
+                    left: pw.BorderSide(width: 1.5),
+                    right: pw.BorderSide(width: 1.5),
+                    bottom: pw.BorderSide(width: 1.5),
+                  ),
+                ),
+                child: pw.Row(
+                  children: [
+                    pw.Text('Asset Number :', style: ts(font: boldFont)),
+                    pw.SizedBox(width: 10),
+                    pw.Text(tag, style: ts(size: 12, font: boldFont)),
+                  ],
+                ),
+              ),
 
-<!-- Verification -->
-<div class="verify-box">
-  <div class="verify-qr">
-    <img src="data:image/svg+xml;base64,$qrBase64" alt="QR">
-    <div class="verify-qr-label">Scan to verify</div>
-  </div>
-  <div class="verify-info">
-    <div class="verify-title">Document Verification</div>
-    <div class="verify-code">$verifyCode</div>
-    <div class="verify-desc">
-      This code is generated from asset tag, recipient name, date and signature fingerprint.<br>
-      Any modification to this document will invalidate this code.
-    </div>
-    <div class="verify-meta">
-      ASSET: $tag &nbsp;|&nbsp; ACTION: $action &nbsp;|&nbsp; DATE: $dateStr &nbsp;|&nbsp; S/N: $serial
-    </div>
-  </div>
-</div>
+              // ── Details header ───────────────────────────────────────
+              pw.Container(
+                color: grey555,
+                padding: const pw.EdgeInsets.symmetric(vertical: 5),
+                child: pw.Text(
+                  'Details of Hardware',
+                  style: ts(size: 11, font: boldFont, color: white),
+                  textAlign: pw.TextAlign.center,
+                ),
+              ),
 
-<div class="footer">Generated by IT Asset Manager — Stream I.T. Consulting Ltd.</div>
+              // ── Details body ─────────────────────────────────────────
+              pw.Container(
+                padding: const pw.EdgeInsets.fromLTRB(12, 8, 12, 12),
+                decoration: const pw.BoxDecoration(
+                  border: pw.Border(
+                    left: pw.BorderSide(width: 1.5),
+                    right: pw.BorderSide(width: 1.5),
+                    bottom: pw.BorderSide(width: 1.5),
+                  ),
+                ),
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+                  children: [
+                    fieldRow('Brand Name :', manufacturer,
+                        label2: 'Model :', value2: model, minW2: 40),
+                    fieldRow('S/N :', serial,
+                        label2: 'Name :', value2: name, minW2: 40),
+                    fieldRow('Harddisk :', '$storageType $capacity',
+                        label2: 'RAM :', value2: ram, minW2: 40),
+                    fieldRow('Monitor :', monitor),
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.only(bottom: 0),
+                      child: pw.Row(
+                        crossAxisAlignment: pw.CrossAxisAlignment.end,
+                        children: [
+                          pw.SizedBox(
+                            width: 80,
+                            child:
+                                pw.Text('Action :', style: ts(font: boldFont)),
+                          ),
+                          pw.Expanded(
+                            child: pw.Container(
+                              decoration: const pw.BoxDecoration(
+                                border: pw.Border(
+                                  bottom: pw.BorderSide(
+                                      color: PdfColors.grey, width: 0.5),
+                                ),
+                              ),
+                              padding: const pw.EdgeInsets.only(bottom: 1),
+                              child: pw.Text(
+                                action,
+                                style: ts(
+                                  font: boldFont,
+                                  color: isCheckOut ? actionBlue : actionGreen,
+                                ),
+                              ),
+                            ),
+                          ),
+                          pw.SizedBox(width: 8),
+                          pw.SizedBox(
+                            width: 40,
+                            child: pw.Text('Date :', style: ts(font: boldFont)),
+                          ),
+                          pw.Expanded(
+                            child: pw.Container(
+                              decoration: const pw.BoxDecoration(
+                                border: pw.Border(
+                                  bottom: pw.BorderSide(
+                                      color: PdfColors.grey, width: 0.5),
+                                ),
+                              ),
+                              padding: const pw.EdgeInsets.only(bottom: 1),
+                              child: pw.Text(dateStr, style: ts()),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
 
-<!-- Print button -->
-<div class="no-print" style="margin-top:20px; text-align:center;">
-  <button onclick="window.print()" style="
-    padding:10px 32px; background:#1A73E8; color:#fff;
-    border:none; border-radius:8px; font-size:14px;
-    font-family:'Sarabun',sans-serif; font-weight:600;
-    cursor:pointer; margin-right:12px;">
-    Print / Save as PDF
-  </button>
-  <button onclick="window.close()" style="
-    padding:10px 24px; background:#fff; color:#607080;
-    border:1px solid #ccc; border-radius:8px; font-size:14px;
-    font-family:'Sarabun',sans-serif; cursor:pointer;">
-    Close
-  </button>
-</div>
+              // ── Remark ──────────────────────────────────────────────
+              pw.Container(
+                padding: const pw.EdgeInsets.all(10),
+                decoration: const pw.BoxDecoration(
+                  border: pw.Border(
+                    left: pw.BorderSide(width: 1.5),
+                    right: pw.BorderSide(width: 1.5),
+                    bottom: pw.BorderSide(width: 1.5),
+                  ),
+                ),
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    // English remark
+                    pw.RichText(
+                      text: pw.TextSpan(
+                        children: [
+                          pw.TextSpan(
+                              text: 'Remark: ',
+                              style: ts(size: 9, font: boldFont)),
+                          pw.TextSpan(
+                            text:
+                                'The employee acknowledges that the Hardware received is the property of '
+                                'Stream I.T. Consulting Ltd. The employee agrees to take care of and maintain '
+                                'the Hardware and a standard no lower than that which a person, in general, '
+                                'would be expected to maintain. The hardware is possessed by the employee for work only.',
+                            style: ts(size: 9),
+                          ),
+                        ],
+                      ),
+                    ),
+                    pw.SizedBox(height: 4),
+                    // Thai remark — uses Sarabun which covers Thai Unicode
+                    pw.RichText(
+                      text: pw.TextSpan(
+                        children: [
+                          pw.TextSpan(
+                              text:
+                                  '\u0e2b\u0e21\u0e32\u0e22\u0e40\u0e2b\u0e15\u0e38: ',
+                              style: ts(size: 9, font: boldFont)),
+                          pw.TextSpan(
+                            text:
+                                '\u0e1e\u0e19\u0e31\u0e01\u0e07\u0e32\u0e19\u0e22\u0e2d\u0e21\u0e23\u0e31\u0e1a\u0e17\u0e23\u0e32\u0e1a\u0e27\u0e48\u0e32\u0e2e\u0e32\u0e23\u0e4c\u0e14\u0e41\u0e27\u0e23\u0e4c\u0e17\u0e35\u0e48\u0e44\u0e14\u0e49\u0e23\u0e31\u0e1a\u0e40\u0e1b\u0e47\u0e19\u0e01\u0e23\u0e23\u0e21\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e4c\u0e02\u0e2d\u0e07\u0e1a\u0e23\u0e34\u0e29\u0e31\u0e17 '
+                                '\u0e1e\u0e19\u0e31\u0e01\u0e07\u0e32\u0e19\u0e15\u0e01\u0e25\u0e07\u0e17\u0e35\u0e48\u0e08\u0e30\u0e14\u0e39\u0e41\u0e25\u0e41\u0e25\u0e30\u0e23\u0e31\u0e01\u0e29\u0e32\u0e2e\u0e32\u0e23\u0e4c\u0e14\u0e41\u0e27\u0e23\u0e4c\u0e43\u0e2b\u0e49\u0e21\u0e35\u0e21\u0e32\u0e15\u0e23\u0e10\u0e32\u0e19\u0e44\u0e21\u0e48\u0e15\u0e48\u0e33\u0e01\u0e27\u0e48\u0e32\u0e17\u0e35\u0e48\u0e1a\u0e38\u0e04\u0e04\u0e25\u0e17\u0e31\u0e48\u0e27\u0e44\u0e1b\u0e04\u0e27\u0e23\u0e08\u0e30\u0e23\u0e31\u0e01\u0e29\u0e32 '
+                                '\u0e42\u0e14\u0e22\u0e2e\u0e32\u0e23\u0e4c\u0e14\u0e41\u0e27\u0e23\u0e4c\u0e17\u0e35\u0e48\u0e44\u0e14\u0e49\u0e23\u0e31\u0e1a\u0e19\u0e35\u0e49\u0e1e\u0e19\u0e31\u0e01\u0e07\u0e32\u0e19\u0e23\u0e31\u0e1a\u0e17\u0e23\u0e32\u0e1a\u0e27\u0e48\u0e32\u0e21\u0e35\u0e44\u0e27\u0e49\u0e2a\u0e33\u0e2b\u0e23\u0e31\u0e1a\u0e43\u0e0a\u0e49\u0e43\u0e19\u0e01\u0e32\u0e23\u0e17\u0e33\u0e07\u0e32\u0e19\u0e40\u0e17\u0e48\u0e32\u0e19\u0e31\u0e49\u0e19',
+                            style: ts(size: 9),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
 
-</body>
-</html>''';
+              pw.SizedBox(height: 14),
+
+              // ── Signature table ──────────────────────────────────────
+              pw.Table(
+                border: pw.TableBorder.all(width: 1.5),
+                columnWidths: {
+                  0: const pw.FlexColumnWidth(2.5),
+                  1: const pw.FlexColumnWidth(1.5),
+                  2: const pw.FlexColumnWidth(3),
+                },
+                children: [
+                  pw.TableRow(
+                    decoration: pw.BoxDecoration(color: greyDDD),
+                    children: [
+                      _tableHeader('Name', boldFont: boldFont, ts: ts),
+                      _tableHeader('Division', boldFont: boldFont, ts: ts),
+                      _tableHeader('Received Date / Signature',
+                          boldFont: boldFont, ts: ts),
+                    ],
+                  ),
+                  pw.TableRow(
+                    children: [
+                      pw.Padding(
+                        padding: const pw.EdgeInsets.all(8),
+                        child: pw.Text(assigneeName, style: ts(font: boldFont)),
+                      ),
+                      pw.Padding(
+                        padding: const pw.EdgeInsets.all(8),
+                        child: pw.Text(division, style: ts()),
+                      ),
+                      pw.Padding(
+                        padding: const pw.EdgeInsets.all(8),
+                        child: pw.Column(
+                          crossAxisAlignment: pw.CrossAxisAlignment.start,
+                          children: [
+                            pw.Image(pw.MemoryImage(sigBytes), height: 55),
+                            pw.Divider(
+                                color: PdfColors.grey300, thickness: 0.5),
+                            pw.Text(assigneeName, style: ts(font: boldFont)),
+                            pw.SizedBox(height: 2),
+                            pw.Text(dateStr,
+                                style: ts(size: 9, color: grey555)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+
+              pw.SizedBox(height: 14),
+
+              // ── Verification box ─────────────────────────────────────
+              pw.Container(
+                decoration: pw.BoxDecoration(
+                  border: pw.Border.all(width: 1.5),
+                ),
+                child: pw.Row(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    // QR
+                    pw.Container(
+                      width: 110,
+                      padding: const pw.EdgeInsets.all(10),
+                      decoration: const pw.BoxDecoration(
+                        border: pw.Border(
+                          right: pw.BorderSide(width: 1.5),
+                        ),
+                      ),
+                      child: pw.Column(
+                        children: [
+                          pw.Image(pw.MemoryImage(qrPngBytes),
+                              width: 85, height: 85),
+                          pw.SizedBox(height: 4),
+                          pw.Text('Scan to verify',
+                              style: ts(size: 7, color: grey555),
+                              textAlign: pw.TextAlign.center),
+                        ],
+                      ),
+                    ),
+                    // Info
+                    pw.Expanded(
+                      child: pw.Padding(
+                        padding: const pw.EdgeInsets.all(10),
+                        child: pw.Column(
+                          crossAxisAlignment: pw.CrossAxisAlignment.start,
+                          children: [
+                            pw.Text('DOCUMENT VERIFICATION',
+                                style: ts(
+                                    size: 8, font: boldFont, color: grey555)),
+                            pw.SizedBox(height: 6),
+                            pw.Text(verifyCode,
+                                style: pw.TextStyle(
+                                  font: pw.Font.courier(),
+                                  fontSize: 16,
+                                  fontWeight: pw.FontWeight.bold,
+                                  letterSpacing: 4,
+                                )),
+                            pw.SizedBox(height: 6),
+                            pw.Text(
+                              'This code is generated from asset tag, recipient name, date and signature fingerprint. '
+                              'Any modification to this document will invalidate this code.',
+                              style: ts(size: 8, color: grey555),
+                            ),
+                            pw.SizedBox(height: 6),
+                            pw.Container(
+                              padding: const pw.EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 5),
+                              decoration: pw.BoxDecoration(
+                                color: greyF5,
+                                borderRadius: pw.BorderRadius.circular(3),
+                              ),
+                              child: pw.Text(
+                                'ASSET: $tag  |  ACTION: $action  |  DATE: $dateStr  |  S/N: $serial',
+                                style: pw.TextStyle(
+                                  font: pw.Font.courier(),
+                                  fontSize: 7,
+                                  color: grey555,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              pw.Spacer(),
+
+              // ── Footer ──────────────────────────────────────────────
+              pw.Text(
+                'Generated by IT Asset Manager — Stream I.T. Consulting Ltd.',
+                style: ts(size: 8, color: grey555),
+                textAlign: pw.TextAlign.right,
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    return doc.save();
   }
 
-  // ── Download HTML file ─────────────────────────────────────────────────────
+  // ── PDF helpers ────────────────────────────────────────────────────────────
 
-  void _downloadHtmlFile(String htmlContent, String action, DateTime now) {
+  pw.Widget _pdfCheckbox(
+    String label, {
+    bool checked = false,
+    required pw.Font baseFont,
+    required pw.Font boldFont,
+  }) {
+    return pw.Row(
+      children: [
+        pw.Container(
+          width: 12,
+          height: 12,
+          decoration: pw.BoxDecoration(
+            border: pw.Border.all(width: 1.5),
+            color:
+                checked ? const PdfColor.fromInt(0xFF333333) : PdfColors.white,
+          ),
+          child: checked
+              ? pw.Center(
+                  child: pw.Transform.rotate(
+                    angle: -0.7854,
+                    child: pw.Container(
+                      width: 5,
+                      height: 8,
+                      decoration: const pw.BoxDecoration(
+                        border: pw.Border(
+                          bottom:
+                              pw.BorderSide(color: PdfColors.white, width: 1.3),
+                          right:
+                              pw.BorderSide(color: PdfColors.white, width: 1.3),
+                        ),
+                      ),
+                    ),
+                  ),
+                )
+              : null,
+        ),
+        pw.SizedBox(width: 5),
+        pw.Text(label, style: pw.TextStyle(font: boldFont, fontSize: 10)),
+      ],
+    );
+  }
+
+  pw.Widget _tableHeader(
+    String text, {
+    required pw.Font boldFont,
+    required pw.TextStyle Function({
+      double size,
+      pw.Font? font,
+      PdfColor color,
+      double? lineSpacing,
+    }) ts,
+  }) {
+    return pw.Padding(
+      padding: const pw.EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+      child: pw.Text(text,
+          style: ts(font: boldFont), textAlign: pw.TextAlign.center),
+    );
+  }
+
+  // ── Download PDF ───────────────────────────────────────────────────────────
+
+  void _downloadPdfFile(Uint8List pdfBytes, String action, DateTime now) {
     try {
       final mm = now.month.toString().padLeft(2, '0');
       final dd = now.day.toString().padLeft(2, '0');
       final hh = now.hour.toString().padLeft(2, '0');
       final min = now.minute.toString().padLeft(2, '0');
-      final filename = '${action}_${now.year}$mm${dd}_$hh$min.html';
+      final filename = '${action}_${now.year}$mm${dd}_$hh$min.pdf';
 
-      final bytes = utf8.encode(htmlContent);
-      final blob = html.Blob(
-        [Uint8List.fromList(bytes)],
-        'text/html;charset=utf-8',
-      );
+      final blob = html.Blob([pdfBytes], 'application/pdf');
       final url = html.Url.createObjectUrlFromBlob(blob);
 
       final anchor = html.document.createElement('a') as html.AnchorElement
@@ -630,9 +895,9 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       anchor.remove();
       html.Url.revokeObjectUrl(url);
 
-      debugPrint('=== [Download] success: $filename');
+      debugPrint('=== [Download PDF] success: $filename');
     } catch (e) {
-      debugPrint('=== [Download] error: $e');
+      debugPrint('=== [Download PDF] error: $e');
     }
   }
 
@@ -647,7 +912,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── Header (fixed) ──────────────────────────────────────────────
+          // ── Header (fixed) ────────────────────────────────────────
           Container(
             padding: const EdgeInsets.fromLTRB(20, 20, 12, 16),
             decoration: const BoxDecoration(
@@ -685,13 +950,13 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             ),
           ),
 
-          // ── Scrollable content ──────────────────────────────────────────
+          // ── Scrollable content ────────────────────────────────────
           Flexible(
             child: SingleChildScrollView(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  // ── Asset info ──────────────────────────────────────────
+                  // ── Asset info ──────────────────────────────────
                   if (widget.asset != null)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
@@ -701,16 +966,14 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                           color: AppConstants.accentBlue.withOpacity(0.06),
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(
-                              color:
-                                  AppConstants.accentBlue.withOpacity(0.2)),
+                              color: AppConstants.accentBlue.withOpacity(0.2)),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Row(children: [
                               const Icon(Icons.laptop_mac,
-                                  size: 14,
-                                  color: AppConstants.accentBlue),
+                                  size: 14, color: AppConstants.accentBlue),
                               const SizedBox(width: 6),
                               Text(
                                 widget.asset!.name ??
@@ -743,28 +1006,24 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                         ),
                       ),
                     ),
-
-                  // ── Remark / ข้อตกลง (checkout only) ────────────────────
+                  // ── Remark (checkout only) ──────────────────────
                   if (widget.isCheckOut)
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
                       child: Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
-                          color:
-                              AppConstants.accentAmber.withOpacity(0.07),
+                          color: AppConstants.accentAmber.withOpacity(0.07),
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(
-                              color: AppConstants.accentAmber
-                                  .withOpacity(0.4)),
+                              color: AppConstants.accentAmber.withOpacity(0.4)),
                         ),
                         child: const Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Row(children: [
                               Icon(Icons.info_outline,
-                                  size: 14,
-                                  color: AppConstants.accentAmber),
+                                  size: 14, color: AppConstants.accentAmber),
                               SizedBox(width: 6),
                               Text(
                                 'ข้อตกลงการรับอุปกรณ์',
@@ -787,7 +1046,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                             SizedBox(height: 6),
                             Text(
                               'หมายเหตุ: พนักงานยอมรับทราบว่าฮาร์ดแวร์ที่ได้รับเป็นกรรมสิทธิ์ของบริษัท '
-                              'พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา'
+                              'พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา '
                               'โดยฮาร์ดแวร์ที่ได้รับนี้พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น',
                               style: TextStyle(
                                   fontSize: 11,
@@ -799,7 +1058,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                       ),
                     ),
 
-                  // ── Instruction ─────────────────────────────────────────
+                  // ── Instruction ─────────────────────────────────
                   const Padding(
                     padding: EdgeInsets.fromLTRB(20, 12, 20, 6),
                     child: Text(
@@ -809,7 +1068,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                     ),
                   ),
 
-                  // ── Error banner ────────────────────────────────────────
+                  // ── Error banner ────────────────────────────────
                   if (_exportError != null)
                     Padding(
                       padding: const EdgeInsets.symmetric(
@@ -820,17 +1079,15 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                           color: AppConstants.accentRed.withOpacity(0.1),
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(
-                              color:
-                                  AppConstants.accentRed.withOpacity(0.4)),
+                              color: AppConstants.accentRed.withOpacity(0.4)),
                         ),
                         child: Text(_exportError!,
                             style: const TextStyle(
-                                color: AppConstants.accentRed,
-                                fontSize: 12)),
+                                color: AppConstants.accentRed, fontSize: 12)),
                       ),
                     ),
 
-                  // ── Signature canvas ────────────────────────────────────
+                  // ── Signature canvas ────────────────────────────
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                     child: Container(
@@ -857,8 +1114,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                             left: 24,
                             right: 24,
                             child: Container(
-                                height: 1,
-                                color: AppConstants.divider),
+                                height: 1, color: AppConstants.divider),
                           ),
                           if (_isEmpty)
                             const Center(
@@ -873,20 +1129,18 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                     ),
                   ),
 
-                  // ── Note ────────────────────────────────────────────────
+                  // ── Note ───────────────────────────────────────
                   const Padding(
                     padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
                     child: Row(
                       children: [
-                        Icon(Icons.verified_outlined,
-                            size: 13,
-                            color: AppConstants.textSecondary),
+                        Icon(Icons.picture_as_pdf_outlined,
+                            size: 13, color: AppConstants.textSecondary),
                         SizedBox(width: 5),
                         Text(
-                          'Document includes QR code & verification code',
+                          'Document will be downloaded as PDF',
                           style: TextStyle(
-                              fontSize: 11,
-                              color: AppConstants.textSecondary),
+                              fontSize: 11, color: AppConstants.textSecondary),
                         ),
                       ],
                     ),
@@ -896,7 +1150,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             ),
           ),
 
-          // ── Actions (fixed) ─────────────────────────────────────────────
+          // ── Actions (fixed) ───────────────────────────────────────
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
             child: Row(
@@ -918,18 +1172,17 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                 ),
                 const Spacer(),
                 ElevatedButton.icon(
-                  onPressed:
-                      (!_isEmpty && !_isExporting) ? _confirm : null,
+                  onPressed: (!_isEmpty && !_isExporting) ? _confirm : null,
                   icon: _isExporting
                       ? const SizedBox(
                           width: 16,
                           height: 16,
                           child: CircularProgressIndicator(
                               strokeWidth: 2, color: Colors.white))
-                      : const Icon(Icons.download_outlined, size: 18),
+                      : const Icon(Icons.picture_as_pdf_outlined, size: 18),
                   label: Text(_isExporting
-                      ? 'Generating…'
-                      : 'Confirm & Download'),
+                      ? 'Generating\u2026'
+                      : 'Confirm & Download PDF'),
                 ),
               ],
             ),
