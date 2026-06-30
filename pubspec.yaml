@@ -1,10 +1,10 @@
 name: snipeit_asset_manager
 description: Internal IT Asset Management App integrated with Snipe-IT
-publish_to: 'none'
+publish_to: "none"
 version: 1.0.0+1
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:
@@ -42,6 +42,10 @@ dependencies:
 
   pdf: ^3.11.1
   printing: ^5.13.1
+  crypto: ^3.0.0
+  html_unescape: ^2.0.0
+  path_provider: ^2.1.0
+  share_plus: ^9.0.0
 
 dev_dependencies:
   flutter_test:

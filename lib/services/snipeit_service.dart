@@ -183,19 +183,6 @@ class SnipeITService {
 
   // ── Users ──────────────────────────────────────────────────────────────────
 
-  /// ดึงข้อมูล user เต็ม (รวม department) จาก id
-  Future<AssetUser?> getUserById(int id) async {
-    try {
-      final response = await _dio.get('users/$id');
-      final data = response.data as Map<String, dynamic>;
-      if (data['id'] == null) return null;
-      return AssetUser.fromJson(data);
-    } on DioException catch (e) {
-      if (e.response?.statusCode == 404) return null;
-      rethrow;
-    }
-  }
-
   Future<List<AssetUser>> searchUsers(String query) async {
     final response = await _dio.get(
       'users',
@@ -205,6 +192,16 @@ class SnipeITService {
     return rows
         .map((e) => AssetUser.fromJson(e as Map<String, dynamic>))
         .toList();
+  }
+
+  /// Fetch user details by ID (รวม department)
+  Future<AssetUser?> getUserById(int userId) async {
+    try {
+      final response = await _dio.get('users/$userId');
+      return AssetUser.fromJson(response.data as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
   }
 
   // ── Manufacturers ──────────────────────────────────────────────────────────
@@ -307,8 +304,8 @@ class SnipeITService {
 
     final uploadDio = Dio(BaseOptions(
       baseUrl: '$_baseUrl/api/v1/',
-      connectTimeout: const Duration(seconds: 30),
-      receiveTimeout: const Duration(seconds: 30),
+      connectTimeout: const Duration(seconds: 8),
+      receiveTimeout: const Duration(seconds: 8),
       headers: {
         'Authorization': 'Bearer $_token',
         'Accept': 'application/json',

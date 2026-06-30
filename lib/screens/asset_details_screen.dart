@@ -7,7 +7,9 @@ import '../services/snipeit_service.dart';
 import '../utils/app_constants.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/signature_dialog.dart';
-import 'edit_asset_screen.dart';
+// EDIT FEATURE DISABLED: ไม่ใช้แล้วเพราะ flow ออกแบบให้แก้ asset ไม่ได้หลังสร้าง
+// ถ้าต้องการเปิดใช้อีกครั้ง ให้ uncomment บรรทัดนี้ และจุดอื่นๆ ที่ comment ไว้ด้านล่าง
+// import 'edit_asset_screen.dart';
 
 class AssetDetailsScreen extends StatefulWidget {
   final AssetModel asset;
@@ -76,15 +78,21 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
 
   // ── Actions ────────────────────────────────────────────────────────────────
 
-  Future<void> _openEditScreen() async {
-    final updated = await Navigator.push<AssetModel>(
-      context,
-      MaterialPageRoute(builder: (_) => EditAssetScreen(asset: _asset)),
-    );
-    if (updated != null && mounted) {
-      setState(() => _asset = updated);
-    }
-  }
+  // EDIT FEATURE DISABLED ───────────────────────────────────────────────────
+  // เก็บฟังก์ชันนี้ไว้เผื่อใช้ในอนาคต ถ้าต้องการเปิดใช้:
+  // 1. Uncomment import 'edit_asset_screen.dart' ด้านบน
+  // 2. Uncomment ฟังก์ชันนี้
+  // 3. Uncomment ปุ่ม Edit ใน AppBar actions ด้านล่าง
+  //
+  // Future<void> _openEditScreen() async {
+  //   final updated = await Navigator.push<AssetModel>(
+  //     context,
+  //     MaterialPageRoute(builder: (_) => EditAssetScreen(asset: _asset)),
+  //   );
+  //   if (updated != null && mounted) {
+  //     setState(() => _asset = updated);
+  //   }
+  // }
 
   /// เบิกอุปกรณ์ให้ User
   Future<void> _handleCheckOut() async {
@@ -270,13 +278,15 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
     return Scaffold(
       appBar: AppBar(
         title: Text(_asset.assetTag ?? 'Asset Details'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            onPressed: _actionLoading ? null : _openEditScreen,
-            tooltip: 'Edit Info',
-          ),
-        ],
+        // EDIT FEATURE DISABLED ─────────────────────────────────────────────
+        // เก็บปุ่ม Edit ไว้เป็น comment เผื่อต้องการเปิดใช้ภายหลัง
+        // actions: [
+        //   IconButton(
+        //     icon: const Icon(Icons.edit_outlined),
+        //     onPressed: _actionLoading ? null : _openEditScreen,
+        //     tooltip: 'Edit Info',
+        //   ),
+        // ],
         bottom: TabBar(
           controller: _tabController,
           indicatorColor: AppConstants.accentBlue,
@@ -383,7 +393,7 @@ class _DetailsTab extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        asset.name ?? asset.assetTag ?? 'Unnamed Asset',
+                        asset.assetTag ?? asset.name ?? 'Unnamed Asset',
                         style: const TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w700,
@@ -391,20 +401,7 @@ class _DetailsTab extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          StatusBadge(label: asset.statusLabel?.name),
-                          if (asset.assetTag != null) ...[
-                            const SizedBox(width: 8),
-                            Text(
-                              asset.assetTag!,
-                              style: const TextStyle(
-                                  fontSize: 12,
-                                  color: AppConstants.textSecondary),
-                            ),
-                          ],
-                        ],
-                      ),
+                      StatusBadge(label: asset.statusLabel?.name),
                     ],
                   ),
                 ),

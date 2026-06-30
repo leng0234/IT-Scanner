@@ -7,6 +7,7 @@ class AssetModel {
   final String? name;
   final AssetManufacturer? manufacturer;
   final AssetModel2? model;
+  final AssetCategory? category; // ADDED: needed to resolve NoteBook/PC/Server on the PDF
   final AssetStatus? statusLabel;
   final AssetUser? assignedTo;
   final String? notes;
@@ -24,6 +25,7 @@ class AssetModel {
     this.name,
     this.manufacturer,
     this.model,
+    this.category,
     this.statusLabel,
     this.assignedTo,
     this.notes,
@@ -47,6 +49,14 @@ class AssetModel {
           : null,
       model: json['model'] != null
           ? AssetModel2.fromJson(json['model'] as Map<String, dynamic>)
+          : null,
+      // Snipe-IT returns this under the "category" key, e.g.
+      // "category": {"id": 3, "name": "Laptops"}.
+      // The asset's *model* may also carry its own category_id, but the
+      // top-level `category` object is what's actually present on the
+      // hardware payload, so that's what we map here.
+      category: json['category'] != null
+          ? AssetCategory.fromJson(json['category'] as Map<String, dynamic>)
           : null,
       statusLabel: json['status_label'] != null
           ? AssetStatus.fromJson(
@@ -92,6 +102,22 @@ class AssetModel2 {
   const AssetModel2({this.id, this.name});
 
   factory AssetModel2.fromJson(Map<String, dynamic> json) => AssetModel2(
+        id: _parseInt(json['id']),
+        name: json['name'] as String?,
+      );
+}
+
+/// ADDED: maps Snipe-IT's `category` object on a hardware asset
+/// (e.g. {"id": 3, "name": "Laptops"}), used to determine which
+/// device-type checkbox (NoteBook / PC / Server) gets ticked on the
+/// generated checkout/checkin PDF.
+class AssetCategory {
+  final int? id;
+  final String? name;
+
+  const AssetCategory({this.id, this.name});
+
+  factory AssetCategory.fromJson(Map<String, dynamic> json) => AssetCategory(
         id: _parseInt(json['id']),
         name: json['name'] as String?,
       );
