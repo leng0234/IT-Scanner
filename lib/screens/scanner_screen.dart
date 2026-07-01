@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../services/snipeit_service.dart';
 import '../utils/app_constants.dart';
@@ -17,13 +18,13 @@ class _ScannerScreenState extends State<ScannerScreen>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final _service = SnipeITService();
 
-  // สร้าง controller ใน initState เพื่อให้ restart ได้
   MobileScannerController? _controller;
 
   bool _isProcessing = false;
   String? _lastError;
   bool _torchOn = false;
   bool _cameraStarted = false;
+  bool _permissionDenied = false;
 
   late final AnimationController _lineController;
   late final Animation<double> _lineAnim;
@@ -42,7 +43,28 @@ class _ScannerScreenState extends State<ScannerScreen>
     );
   }
 
-  void _initCamera() {
+  Future<void> _initCamera() async {
+    // ขอ permission กล้องก่อนเสมอ
+    final status = await Permission.camera.request();
+    if (!mounted) return;
+
+    if (!status.isGranted) {
+      setState(() {
+        _permissionDenied = true;
+        _cameraStarted = false;
+        _lastError = status.isPermanentlyDenied
+            ? 'กรุณาเปิดอนุญาตกล้องในการตั้งค่าของโทรศัพท์'
+            : 'กรุณาอนุญาตการใช้งานกล้อง';
+      });
+      return;
+    }
+
+    setState(() {
+      _permissionDenied = false;
+      _lastError = null;
+    });
+
+    // ได้ permission แล้วค่อยสร้าง controller
     _controller = MobileScannerController(
       detectionSpeed: DetectionSpeed.noDuplicates,
       facing: CameraFacing.back,
@@ -59,7 +81,6 @@ class _ScannerScreenState extends State<ScannerScreen>
 
     switch (state) {
       case AppLifecycleState.resumed:
-        // กลับมาจาก background — restart camera
         if (!_isProcessing) {
           _controller!.start();
         }
@@ -123,7 +144,6 @@ class _ScannerScreenState extends State<ScannerScreen>
     } finally {
       if (mounted) {
         setState(() => _isProcessing = false);
-        // หน่วงเล็กน้อยก่อน restart กล้อง
         await Future.delayed(const Duration(milliseconds: 300));
         await _controller?.start();
       }
@@ -133,15 +153,14 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ── Manual entry ───────────────────────────────────────────────────────────
 
   Future<void> _showManualEntry() async {
-    // หยุดกล้องชั่วคราว
     await _controller?.stop();
 
     final controller = TextEditingController();
     final tag = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16)),
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Row(
           children: [
             Icon(Icons.search, color: AppConstants.accentBlue),
@@ -153,7 +172,7 @@ class _ScannerScreenState extends State<ScannerScreen>
           controller: controller,
           autofocus: true,
           decoration: const InputDecoration(
-            hintText: 'กรอก Asset Tag หรือ Serial Number',
+            hintText: 'กรอก Asset Tag',
             prefixIcon: Icon(Icons.qr_code),
           ),
           textCapitalization: TextCapitalization.characters,
@@ -165,8 +184,7 @@ class _ScannerScreenState extends State<ScannerScreen>
             child: const Text('ยกเลิก'),
           ),
           ElevatedButton(
-            onPressed: () =>
-                Navigator.of(ctx).pop(controller.text.trim()),
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
             child: const Text('ค้นหา'),
           ),
         ],
@@ -176,22 +194,29 @@ class _ScannerScreenState extends State<ScannerScreen>
     if (tag != null && tag.isNotEmpty) {
       await _lookupAsset(tag);
     } else {
-      // ถ้ายกเลิก restart กล้องกลับ
       await _controller?.start();
     }
   }
 
-  // ── Restart camera (ปุ่ม retry) ───────────────────────────────────────────
+  // ── Restart camera ─────────────────────────────────────────────────────────
 
   Future<void> _restartCamera() async {
     setState(() {
       _cameraStarted = false;
       _lastError = null;
+      _permissionDenied = false;
     });
+    await _controller?.stop();
     await _controller?.dispose();
-    await Future.delayed(const Duration(milliseconds: 500));
-    _initCamera();
+    _controller = null;
+    // รอให้ระบบ release กล้องก่อนสร้างใหม่
+    await Future.delayed(const Duration(milliseconds: 800));
+    await _initCamera();
   }
+
+  // ── Open app settings (กรณี permission ถูก deny permanently) ──────────────
+
+  void _openAppSettings() => openAppSettings();
 
   // ── Build ──────────────────────────────────────────────────────────────────
 
@@ -207,18 +232,19 @@ class _ScannerScreenState extends State<ScannerScreen>
               Icons.flash_on,
               color: _torchOn ? AppConstants.accentAmber : Colors.white70,
             ),
-            onPressed: () {
-              _controller?.toggleTorch();
-              setState(() => _torchOn = !_torchOn);
-            },
+            onPressed: _cameraStarted
+                ? () {
+                    _controller?.toggleTorch();
+                    setState(() => _torchOn = !_torchOn);
+                  }
+                : null,
             tooltip: 'Toggle torch',
           ),
           IconButton(
             icon: const Icon(Icons.cameraswitch_outlined),
-            onPressed: () => _controller?.switchCamera(),
+            onPressed: _cameraStarted ? () => _controller?.switchCamera() : null,
             tooltip: 'Flip camera',
           ),
-          // ปุ่ม restart กล้อง (กรณีจอดำ)
           IconButton(
             icon: const Icon(Icons.refresh, color: Colors.white70),
             onPressed: _restartCamera,
@@ -228,8 +254,14 @@ class _ScannerScreenState extends State<ScannerScreen>
       ),
       body: Stack(
         children: [
-          // ── Camera feed ──────────────────────────────────────────────────
-          if (_controller != null && _cameraStarted)
+          // ── Camera feed ────────────────────────────────────────────────
+          if (_permissionDenied)
+            _PermissionDeniedView(
+              isPermanent: _lastError?.contains('การตั้งค่า') ?? false,
+              onRetry: _restartCamera,
+              onOpenSettings: _openAppSettings,
+            )
+          else if (_controller != null && _cameraStarted)
             MobileScanner(
               controller: _controller!,
               onDetect: _onBarcodeDetected,
@@ -263,11 +295,11 @@ class _ScannerScreenState extends State<ScannerScreen>
               child: CircularProgressIndicator(color: Colors.white54),
             ),
 
-          // ── Scan window overlay ──────────────────────────────────────────
-          if (_cameraStarted)
+          // ── Scan overlay ───────────────────────────────────────────────
+          if (_cameraStarted && !_permissionDenied)
             _ScanOverlay(lineAnimation: _lineAnim),
 
-          // ── Bottom panel ─────────────────────────────────────────────────
+          // ── Bottom panel ───────────────────────────────────────────────
           Positioned(
             left: 0,
             right: 0,
@@ -280,10 +312,61 @@ class _ScannerScreenState extends State<ScannerScreen>
             ),
           ),
 
-          // ── Loading overlay ──────────────────────────────────────────────
+          // ── Loading overlay ────────────────────────────────────────────
           if (_isProcessing)
             const LoadingOverlay(message: 'กำลังค้นหา Asset…'),
         ],
+      ),
+    );
+  }
+}
+
+// ── Permission denied view ────────────────────────────────────────────────
+
+class _PermissionDeniedView extends StatelessWidget {
+  final bool isPermanent;
+  final VoidCallback onRetry;
+  final VoidCallback onOpenSettings;
+
+  const _PermissionDeniedView({
+    required this.isPermanent,
+    required this.onRetry,
+    required this.onOpenSettings,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.no_photography_outlined,
+                color: Colors.white54, size: 64),
+            const SizedBox(height: 16),
+            Text(
+              isPermanent
+                  ? 'กรุณาเปิดอนุญาตกล้องในการตั้งค่าของโทรศัพท์'
+                  : 'แอปต้องการสิทธิ์เข้าถึงกล้องเพื่อสแกนบาร์โค้ด',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+            const SizedBox(height: 24),
+            if (isPermanent)
+              ElevatedButton.icon(
+                onPressed: onOpenSettings,
+                icon: const Icon(Icons.settings_outlined, size: 18),
+                label: const Text('เปิดการตั้งค่า'),
+              )
+            else
+              ElevatedButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('อนุญาตกล้อง'),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -518,7 +601,7 @@ class _BottomPanel extends StatelessWidget {
             child: OutlinedButton.icon(
               onPressed: isProcessing ? null : onManualEntry,
               icon: const Icon(Icons.keyboard_outlined, size: 18),
-              label: const Text('กรอก Asset Tag / Serial Number'),
+              label: const Text('กรอก Asset Tag'),
               style: OutlinedButton.styleFrom(
                 foregroundColor: Colors.white70,
                 side: const BorderSide(color: Colors.white24),

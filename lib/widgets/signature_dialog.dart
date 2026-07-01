@@ -1,9 +1,10 @@
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:crypto/crypto.dart'; // real cryptographic hashing
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:html_unescape/html_unescape.dart'; // replaces hand-rolled entity decoder
@@ -12,19 +13,27 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:qr/qr.dart';
 import 'package:signature/signature.dart';
 
-// Web-only download path.
-import 'package:universal_html/html.dart' as html;
+import '../models/asset_model.dart';
+import '../utils/app_constants.dart';
 
-// Non-web download/share path.
+// Platform-specific PDF download/share implementation.
+// - Web builds resolve to pdf_downloader_web.dart (dart:html)
+// - Native (Android/iOS/desktop) builds resolve to pdf_downloader_native.dart
+//   (path_provider + share_plus)
+// - Anything else falls back to pdf_downloader_stub.dart
+//
+// Splitting this out (instead of importing dart:html / dart:io / path_provider
+// / share_plus directly in this file behind an `if (kIsWeb)` check) is required
+// because the Dart web compiler still has to be able to *resolve* every
+// import in the file, even ones guarded by a runtime kIsWeb check — and
+// dart:io simply doesn't exist on web, which broke web builds.
+//
 // NOTE: add these to pubspec.yaml if not already present:
 //   path_provider: ^2.1.0
 //   share_plus: ^9.0.0
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
-import 'dart:io' as io;
-
-import '../models/asset_model.dart';
-import '../utils/app_constants.dart';
+import 'pdf_downloader_stub.dart'
+    if (dart.library.html) 'pdf_downloader_web.dart'
+    if (dart.library.io) 'pdf_downloader_native.dart';
 
 // NOTE: device-type checkbox logic (NoteBook/PC/Server) reads
 // `asset.category?.name`, falling back to `asset.model?.name` if the
@@ -71,14 +80,21 @@ class _PdfLayoutConstants {
 /// FIX #8: Font bytes are loaded once and cached at the class (static)
 /// level instead of being re-read from the asset bundle on every single
 /// checkout/checkin PDF generation.
+///
+/// `ensureLoaded()` is idempotent based on whether the fonts are already
+/// populated, rather than a one-shot "attempted" flag — so if a load ever
+/// fails (e.g. transient asset-bundle hiccup), the next call will retry
+/// instead of being permanently stuck on `null` fonts for the rest of the
+/// app's lifetime.
 class _FontCache {
   static pw.Font? sarabunRegular;
   static pw.Font? sarabunBold;
-  static bool _attempted = false;
 
   static Future<void> ensureLoaded() async {
-    if (_attempted) return;
-    _attempted = true;
+    if (sarabunRegular != null && sarabunBold != null) {
+      return;
+    }
+
     sarabunRegular = await _load('assets/fonts/Sarabun-Regular.ttf');
     sarabunBold = await _load('assets/fonts/Sarabun-Bold.ttf');
   }
@@ -97,9 +113,13 @@ class _FontCache {
 
 /// FIX #1 + #2: Real SHA-256 based document verification, computed over the
 /// *entire* signature image (not just the first 32 bytes, which are mostly
-/// constant PNG header bytes and don't meaningfully distinguish signatures),
-/// plus a high-resolution timestamp + random nonce so two documents signed
-/// within the same minute can't collide (FIX #10).
+/// constant PNG header bytes and don't meaningfully distinguish signatures).
+///
+/// The verification code is derived only from the asset tag, recipient
+/// name, date, action, and signature image hash — deliberately with no
+/// random nonce — so the exact same inputs always regenerate the exact same
+/// code and the document can be independently re-verified later, rather than
+/// only being checkable at generation time.
 class _DocumentVerification {
   static String sha256Hex(String input) {
     return sha256.convert(utf8.encode(input)).toString();
@@ -117,9 +137,7 @@ class _DocumentVerification {
     required Uint8List sigBytes,
   }) {
     final sigFingerprint = sha256HexBytes(sigBytes);
-    final nonce = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
-    final payload =
-        '$assetTag|$assigneeName|$dateStr|$action|$sigFingerprint|$nonce';
+    final payload = '$assetTag|$assigneeName|$dateStr|$action|$sigFingerprint';
     final hash = sha256Hex(payload);
     // Take a readable slice of the full hash for display purposes; the
     // full hash above is still cryptographically derived from all inputs,
@@ -151,6 +169,19 @@ class _SignatureDialog extends StatefulWidget {
   @override
   State<_SignatureDialog> createState() => _SignatureDialogState();
 }
+
+/// FIX: `_tableHeader` used to take its `ts` parameter as an inline
+/// generalized function type (`required pw.TextStyle Function({...}) ts`).
+/// With several named parameters nested inside, some Dart analyzer versions
+/// mis-parse that inline form and incorrectly report the `pw` import prefix
+/// as "shadowed by a local declaration". Pulling the signature out into a
+/// standalone typedef avoids the inline nesting entirely and resolves it.
+typedef _PdfTextStyleBuilder = pw.TextStyle Function({
+  double size,
+  pw.Font? font,
+  PdfColor color,
+  double? lineSpacing,
+});
 
 class _SignatureDialogState extends State<_SignatureDialog> {
   late final SignatureController _controller;
@@ -380,6 +411,9 @@ class _SignatureDialogState extends State<_SignatureDialog> {
 
     final qrPngBytes = await _generateQrPngBytes(qrData);
 
+    // FIX #8: use the cached fonts instead of reloading from disk every time.
+    await _FontCache.ensureLoaded();
+
     // Logo
     Uint8List? logoBytes;
     try {
@@ -388,9 +422,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     } catch (e, st) {
       debugPrint('=== [PDF] Failed to load logo: $e\n$st');
     }
-
-    // FIX #8: use the cached fonts instead of reloading from disk every time.
-    await _FontCache.ensureLoaded();
 
     final pdfBytes = await _buildPdf(
       action: action,
@@ -557,8 +588,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       return pw.Column(
         children: [
           pw.Container(
-            padding:
-                const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+            padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
             decoration: pw.BoxDecoration(
               color: greyF0,
               border: pw.Border.all(width: 1.5),
@@ -582,8 +612,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             ),
           ),
           pw.Container(
-            padding:
-                const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+            padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
             decoration: const pw.BoxDecoration(
               border: pw.Border(
                 left: pw.BorderSide(width: 1.5),
@@ -627,63 +656,63 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             pw.Container(
               padding: const pw.EdgeInsets.fromLTRB(12, 8, 12, 12),
               child: pw.Column(
-              crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-              children: [
-                fieldRow('Brand Name :', manufacturer,
-                    label2: 'Model :', value2: model, minW2: 40),
-                fieldRow('S/N :', serial, minW1: 80),
-                fieldRow('Harddisk :', '$storageType $capacity',
-                    label2: 'RAM :', value2: ram, minW2: 40),
-                fieldRow('Monitor :', monitor),
-                pw.Padding(
-                  padding: const pw.EdgeInsets.only(bottom: 0),
-                  child: pw.Row(
-                    crossAxisAlignment: pw.CrossAxisAlignment.end,
-                    children: [
-                      pw.SizedBox(
-                        width: 80,
-                        child: pw.Text('Action :', style: ts(font: boldFont)),
-                      ),
-                      pw.Expanded(
-                        child: pw.Container(
-                          decoration: const pw.BoxDecoration(
-                            border: pw.Border(
-                              bottom: pw.BorderSide(
-                                  color: PdfColors.grey, width: 0.5),
+                crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+                children: [
+                  fieldRow('Brand Name :', manufacturer,
+                      label2: 'Model :', value2: model, minW2: 40),
+                  fieldRow('S/N :', serial, minW1: 80),
+                  fieldRow('Harddisk :', '$storageType $capacity',
+                      label2: 'RAM :', value2: ram, minW2: 40),
+                  fieldRow('Monitor :', monitor),
+                  pw.Padding(
+                    padding: const pw.EdgeInsets.only(bottom: 0),
+                    child: pw.Row(
+                      crossAxisAlignment: pw.CrossAxisAlignment.end,
+                      children: [
+                        pw.SizedBox(
+                          width: 80,
+                          child: pw.Text('Action :', style: ts(font: boldFont)),
+                        ),
+                        pw.Expanded(
+                          child: pw.Container(
+                            decoration: const pw.BoxDecoration(
+                              border: pw.Border(
+                                bottom: pw.BorderSide(
+                                    color: PdfColors.grey, width: 0.5),
+                              ),
                             ),
-                          ),
-                          padding: const pw.EdgeInsets.only(bottom: 1),
-                          child: pw.Text(
-                            action,
-                            style: ts(
-                              font: boldFont,
-                              color: isCheckOut ? actionBlue : actionGreen,
+                            padding: const pw.EdgeInsets.only(bottom: 1),
+                            child: pw.Text(
+                              action,
+                              style: ts(
+                                font: boldFont,
+                                color: isCheckOut ? actionBlue : actionGreen,
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                      pw.SizedBox(width: 8),
-                      pw.SizedBox(
-                        width: 40,
-                        child: pw.Text('Date :', style: ts(font: boldFont)),
-                      ),
-                      pw.Expanded(
-                        child: pw.Container(
-                          decoration: const pw.BoxDecoration(
-                            border: pw.Border(
-                              bottom: pw.BorderSide(
-                                  color: PdfColors.grey, width: 0.5),
-                            ),
-                          ),
-                          padding: const pw.EdgeInsets.only(bottom: 1),
-                          child: pw.Text(dateStr, style: ts()),
+                        pw.SizedBox(width: 8),
+                        pw.SizedBox(
+                          width: 40,
+                          child: pw.Text('Date :', style: ts(font: boldFont)),
                         ),
-                      ),
-                    ],
+                        pw.Expanded(
+                          child: pw.Container(
+                            decoration: const pw.BoxDecoration(
+                              border: pw.Border(
+                                bottom: pw.BorderSide(
+                                    color: PdfColors.grey, width: 0.5),
+                              ),
+                            ),
+                            padding: const pw.EdgeInsets.only(bottom: 1),
+                            child: pw.Text(dateStr, style: ts()),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
-            ),
+                ],
+              ),
             ),
           ],
         ),
@@ -755,41 +784,51 @@ class _SignatureDialogState extends State<_SignatureDialog> {
           ),
           pw.TableRow(
             children: [
+              // Name: horizontal-center only, vertical position unchanged (top, default)
               pw.Padding(
                 padding: const pw.EdgeInsets.all(8),
-                child: pw.Text(assigneeName, style: ts(font: boldFont)),
+                child: pw.Text(
+                  assigneeName,
+                  style: ts(font: boldFont),
+                  textAlign: pw.TextAlign.center,
+                ),
               ),
+              // Division: horizontal-center only, vertical position unchanged (top, default)
               pw.Padding(
                 padding: const pw.EdgeInsets.all(8),
-                child: pw.Text(division, style: ts()),
+                child: pw.Text(
+                  division,
+                  style: ts(),
+                  textAlign: pw.TextAlign.center,
+                ),
               ),
-              pw.Padding(
+              // Signature: fixed-height wrapper so the row stretches to this
+              // height, then Align(center) centers the block both ways inside it.
+              pw.Container(
+                height: 100,
                 padding: const pw.EdgeInsets.all(8),
-                child: pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.start,
-                  children: [
-                    // FIX: previously only `height` was set, with no width
-                    // constraint and no fit behavior. The actual exported
-                    // PNG's aspect ratio doesn't always match the requested
-                    // 600x300 canvas (the `signature` package bases the
-                    // export on the on-screen pad size), so the image could
-                    // render far wider than the table cell and overflow
-                    // past its right edge uncropped. Locking both width and
-                    // height with BoxFit.contain guarantees it always fits.
-                    pw.Container(
-                      width: 150,
-                      height: 55,
-                      alignment: pw.Alignment.centerLeft,
-                      child: pw.Image(
-                        pw.MemoryImage(sigBytes),
-                        fit: pw.BoxFit.contain,
+                child: pw.Align(
+                  alignment: pw.Alignment.centerLeft,
+                  child: pw.Column(
+                    mainAxisSize: pw.MainAxisSize.min,
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Container(
+                        width: 150,
+                        height: 55,
+                        alignment: pw.Alignment
+                            .center, // signature image itself centered
+                        child: pw.Image(
+                          pw.MemoryImage(sigBytes),
+                          fit: pw.BoxFit.contain,
+                        ),
                       ),
-                    ),
-                    pw.Divider(color: PdfColors.grey300, thickness: 0.5),
-                    pw.Text(assigneeName, style: ts(font: boldFont)),
-                    pw.SizedBox(height: 2),
-                    pw.Text(dateStr, style: ts(size: 9, color: grey555)),
-                  ],
+                      pw.Divider(color: PdfColors.grey300, thickness: 0.5),
+                      pw.Text(assigneeName, style: ts(font: boldFont)),
+                      pw.SizedBox(height: 2),
+                      pw.Text(dateStr, style: ts(size: 9, color: grey555)),
+                    ],
+                  ),
                 ),
               ),
             ],
@@ -841,8 +880,8 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                         )),
                     pw.SizedBox(height: 6),
                     pw.Text(
-                      'This code is generated from asset tag, recipient name, date, signature image hash '
-                      'and a unique nonce. Any modification to this document will invalidate this code.',
+                      'This code is generated from asset tag, recipient name, date, action and signature image hash. '
+                      'Any modification to this document will invalidate this code.',
                       style: ts(size: 8, color: grey555),
                     ),
                     pw.SizedBox(height: 6),
@@ -954,12 +993,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
   pw.Widget _tableHeader(
     String text, {
     required pw.Font boldFont,
-    required pw.TextStyle Function({
-      double size,
-      pw.Font? font,
-      PdfColor color,
-      double? lineSpacing,
-    }) ts,
+    required _PdfTextStyleBuilder ts,
   }) {
     return pw.Padding(
       padding: const pw.EdgeInsets.symmetric(vertical: 6, horizontal: 8),
@@ -969,59 +1003,35 @@ class _SignatureDialogState extends State<_SignatureDialog> {
   }
 
   // ── Download / share PDF ────────────────────────────────────────────────────
-  // FIX #9: web uses a Blob download (universal_html); any other platform
-  // (Android/iOS/desktop) writes the PDF to the app's temporary directory
-  // and opens the native share/save sheet via share_plus, since
-  // dart:html-style Blob downloads do not work outside of a real browser.
+  // FIX #9: platform-specific download/share behavior now lives entirely in
+  // pdf_downloader_stub.dart / pdf_downloader_web.dart / pdf_downloader_native.dart,
+  // selected at compile time via a conditional import. That's what actually
+  // makes web builds compile — a runtime `if (kIsWeb)` check alone doesn't
+  // stop the web compiler from trying (and failing) to resolve dart:io,
+  // path_provider, and share_plus.
 
   Future<void> _downloadPdfFile(
-      Uint8List pdfBytes, String action, DateTime now) async {
+    Uint8List pdfBytes,
+    String action,
+    DateTime now,
+  ) async {
     final mm = now.month.toString().padLeft(2, '0');
     final dd = now.day.toString().padLeft(2, '0');
     final hh = now.hour.toString().padLeft(2, '0');
     final min = now.minute.toString().padLeft(2, '0');
+
     final filename = '${action}_${now.year}$mm${dd}_$hh$min.pdf';
 
-    if (kIsWeb) {
-      try {
-        final blob = html.Blob([pdfBytes], 'application/pdf');
-        final url = html.Url.createObjectUrlFromBlob(blob);
-
-        final anchor = html.document.createElement('a') as html.AnchorElement
-          ..href = url
-          ..download = filename
-          ..style.display = 'none';
-
-        html.document.body!.append(anchor);
-        anchor.click();
-        anchor.remove();
-        html.Url.revokeObjectUrl(url);
-
-        debugPrint('=== [Download PDF] success (web): $filename');
-      } catch (e, st) {
-        debugPrint('=== [Download PDF] web error: $e\n$st');
-      }
-      return;
-    }
-
-    // Mobile / desktop path.
     try {
-      final dir = await getTemporaryDirectory();
-      final file = io.File('${dir.path}/$filename');
-      await file.writeAsBytes(pdfBytes, flush: true);
+      await downloadOrSharePdf(pdfBytes, filename);
 
-      await Share.shareXFiles(
-        [XFile(file.path, mimeType: 'application/pdf', name: filename)],
-        text: filename,
-      );
-
-      debugPrint('=== [Download PDF] success (native share): $filename');
+      debugPrint('=== [Download PDF] success: $filename');
     } catch (e, st) {
-      debugPrint('=== [Download PDF] native error: $e\n$st');
+      debugPrint('=== [Download PDF] error: $e\n$st');
+
       if (mounted) {
         setState(() {
-          _exportError =
-              'Signature saved, but the PDF could not be shared: $e';
+          _exportError = 'PDF could not be saved/shared: $e';
         });
       }
     }
@@ -1180,7 +1190,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                         ),
                       ),
                     ),
-
                   const Padding(
                     padding: EdgeInsets.fromLTRB(20, 12, 20, 6),
                     child: Text(
@@ -1189,7 +1198,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                           color: AppConstants.textSecondary, fontSize: 13),
                     ),
                   ),
-
                   if (_exportError != null)
                     Padding(
                       padding: const EdgeInsets.symmetric(
@@ -1207,7 +1215,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                                 color: AppConstants.accentRed, fontSize: 12)),
                       ),
                     ),
-
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                     child: Container(
@@ -1248,7 +1255,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                       ),
                     ),
                   ),
-
                   const Padding(
                     padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
                     child: Row(
@@ -1311,7 +1317,3 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     );
   }
 }
-
-/// Small helper so we don't need to import dart:async just for this one
-/// fire-and-forget call.
-void unawaited(Future<void> future) {}
