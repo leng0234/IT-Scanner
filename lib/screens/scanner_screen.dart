@@ -26,6 +26,31 @@ class _ScannerScreenState extends State<ScannerScreen>
   bool _cameraStarted = false;
   bool _permissionDenied = false;
 
+  // True only while the native scanner session is actually running.
+  // Distinct from _cameraStarted, which stays true across temporary
+  // stop()/start() cycles (e.g. while looking up an asset). Any UI
+  // action that talks to the controller (torch, switch camera) must
+  // gate on this, not on _cameraStarted.
+  bool _scannerActive = false;
+
+  // True only after the MobileScanner widget has actually been built and
+  // its platform view attached (i.e. after the post-frame callback in
+  // _initCamera has run). Distinct from `_controller != null`, which
+  // becomes true as soon as the controller object is constructed but
+  // before the widget tree (and therefore the native platform view) has
+  // been built. The app-lifecycle handler must gate on this flag, not on
+  // `_controller != null`, otherwise a `resumed` event arriving in the gap
+  // between controller construction and the post-frame callback (e.g.
+  // right after returning from the OS permission dialog) will call
+  // start() on a session whose platform view isn't attached yet, hitting
+  // the same NullPointerException on the "scanner/method" channel that
+  // autoStart: false was meant to avoid.
+  bool _controllerAttached = false;
+
+  // Guards against overlapping _restartCamera() calls if the user
+  // taps refresh multiple times before the previous restart finishes.
+  bool _restarting = false;
+
   late final AnimationController _lineController;
   late final Animation<double> _lineAnim;
 
@@ -52,6 +77,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       setState(() {
         _permissionDenied = true;
         _cameraStarted = false;
+        _scannerActive = false;
         _lastError = status.isPermanentlyDenied
             ? 'กรุณาเปิดอนุญาตกล้องในการตั้งค่าของโทรศัพท์'
             : 'กรุณาอนุญาตการใช้งานกล้อง';
@@ -65,31 +91,53 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
 
     // ได้ permission แล้วค่อยสร้าง controller
+    //
+    // IMPORTANT: autoStart is deliberately false. With autoStart: true,
+    // mobile_scanner invokes start() on its method channel synchronously
+    // during controller construction. When this construction happens right
+    // after returning from the OS permission-grant activity, the native
+    // platform view/method channel for the scanner is not guaranteed to be
+    // re-attached yet, and that internal start() call throws a
+    // NullPointerException on the "scanner/method" channel (native session
+    // object is null). Starting manually after the widget has built avoids
+    // the race.
     _controller = MobileScannerController(
       detectionSpeed: DetectionSpeed.noDuplicates,
       facing: CameraFacing.back,
       torchEnabled: false,
-      autoStart: true,
+      autoStart: false,
     );
-    if (mounted) setState(() => _cameraStarted = true);
+    _controllerAttached = false;
+    if (mounted) {
+      setState(() => _cameraStarted = true);
+    }
+    // Defer starting until after this frame, so the MobileScanner widget
+    // (and its platform view) has actually been built and attached before
+    // we ask the plugin to start the camera session.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _controllerAttached = true;
+        _safeStart();
+      }
+    });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    if (_controller == null) return;
+    if (_controller == null || !_controllerAttached) return;
 
     switch (state) {
       case AppLifecycleState.resumed:
         if (!_isProcessing) {
-          _controller!.start();
+          _safeStart();
         }
         break;
       case AppLifecycleState.inactive:
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
-        _controller!.stop();
+        _safeStop();
         break;
     }
   }
@@ -100,6 +148,54 @@ class _ScannerScreenState extends State<ScannerScreen>
     _controller?.dispose();
     _lineController.dispose();
     super.dispose();
+  }
+
+  // ── Safe controller wrappers ────────────────────────────────────────────
+  //
+  // mobile_scanner's native session can be torn down (stop/dispose) while
+  // an async op is still in flight. Calling start/stop/toggleTorch/
+  // switchCamera on a torn-down session throws a NullPointerException on
+  // the platform side (method channel "scanner/method"). These wrappers
+  // centralize the state bookkeeping and swallow that failure mode instead
+  // of letting it surface as a native crash log.
+
+  Future<void> _safeStart() async {
+    if (_controller == null || !mounted) return;
+    try {
+      await _controller!.start();
+      if (mounted) setState(() => _scannerActive = true);
+    } catch (_) {
+      // Session may already be running or camera unavailable; ignore.
+    }
+  }
+
+  Future<void> _safeStop() async {
+    if (_controller == null) return;
+    if (mounted) setState(() => _scannerActive = false);
+    try {
+      await _controller!.stop();
+    } catch (_) {
+      // Already stopped/disposed; nothing to do.
+    }
+  }
+
+  Future<void> _safeToggleTorch() async {
+    if (_controller == null || !_scannerActive) return;
+    try {
+      await _controller!.toggleTorch();
+      if (mounted) setState(() => _torchOn = !_torchOn);
+    } catch (_) {
+      // Ignore — session wasn't ready.
+    }
+  }
+
+  Future<void> _safeSwitchCamera() async {
+    if (_controller == null || !_scannerActive) return;
+    try {
+      await _controller!.switchCamera();
+    } catch (_) {
+      // Ignore — session wasn't ready.
+    }
   }
 
   // ── Barcode handling ───────────────────────────────────────────────────────
@@ -121,7 +217,7 @@ class _ScannerScreenState extends State<ScannerScreen>
     });
 
     try {
-      await _controller?.stop();
+      await _safeStop();
       final asset = await _service.getAssetByTag(tag);
 
       if (!mounted) return;
@@ -140,12 +236,14 @@ class _ScannerScreenState extends State<ScannerScreen>
         });
       }
     } catch (e) {
-      setState(() => _lastError = 'เกิดข้อผิดพลาด: ${e.toString()}');
+      if (mounted) {
+        setState(() => _lastError = 'เกิดข้อผิดพลาด: ${e.toString()}');
+      }
     } finally {
       if (mounted) {
         setState(() => _isProcessing = false);
         await Future.delayed(const Duration(milliseconds: 300));
-        await _controller?.start();
+        await _safeStart();
       }
     }
   }
@@ -153,14 +251,13 @@ class _ScannerScreenState extends State<ScannerScreen>
   // ── Manual entry ───────────────────────────────────────────────────────────
 
   Future<void> _showManualEntry() async {
-    await _controller?.stop();
+    await _safeStop();
 
     final controller = TextEditingController();
     final tag = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Row(
           children: [
             Icon(Icons.search, color: AppConstants.accentBlue),
@@ -191,27 +288,43 @@ class _ScannerScreenState extends State<ScannerScreen>
       ),
     );
 
+    if (!mounted) return;
+
     if (tag != null && tag.isNotEmpty) {
       await _lookupAsset(tag);
     } else {
-      await _controller?.start();
+      await _safeStart();
     }
   }
 
   // ── Restart camera ─────────────────────────────────────────────────────────
 
   Future<void> _restartCamera() async {
-    setState(() {
-      _cameraStarted = false;
-      _lastError = null;
-      _permissionDenied = false;
-    });
-    await _controller?.stop();
-    await _controller?.dispose();
-    _controller = null;
-    // รอให้ระบบ release กล้องก่อนสร้างใหม่
-    await Future.delayed(const Duration(milliseconds: 800));
-    await _initCamera();
+    if (_restarting) return;
+    _restarting = true;
+    try {
+      setState(() {
+        _cameraStarted = false;
+        _scannerActive = false;
+        _lastError = null;
+        _permissionDenied = false;
+      });
+      _controllerAttached = false;
+      final old = _controller;
+      _controller = null;
+      try {
+        await old?.stop();
+      } catch (_) {}
+      try {
+        await old?.dispose();
+      } catch (_) {}
+      // รอให้ระบบ release กล้องก่อนสร้างใหม่
+      await Future.delayed(const Duration(milliseconds: 800));
+      if (!mounted) return;
+      await _initCamera();
+    } finally {
+      _restarting = false;
+    }
   }
 
   // ── Open app settings (กรณี permission ถูก deny permanently) ──────────────
@@ -232,22 +345,20 @@ class _ScannerScreenState extends State<ScannerScreen>
               Icons.flash_on,
               color: _torchOn ? AppConstants.accentAmber : Colors.white70,
             ),
-            onPressed: _cameraStarted
-                ? () {
-                    _controller?.toggleTorch();
-                    setState(() => _torchOn = !_torchOn);
-                  }
-                : null,
+            // Gate on _scannerActive (not _cameraStarted) so this is
+            // disabled while the session is stopped for a lookup or
+            // for the manual-entry dialog.
+            onPressed: _scannerActive ? _safeToggleTorch : null,
             tooltip: 'Toggle torch',
           ),
           IconButton(
             icon: const Icon(Icons.cameraswitch_outlined),
-            onPressed: _cameraStarted ? () => _controller?.switchCamera() : null,
+            onPressed: _scannerActive ? _safeSwitchCamera : null,
             tooltip: 'Flip camera',
           ),
           IconButton(
             icon: const Icon(Icons.refresh, color: Colors.white70),
-            onPressed: _restartCamera,
+            onPressed: _restarting ? null : _restartCamera,
             tooltip: 'Restart camera',
           ),
         ],
@@ -265,7 +376,7 @@ class _ScannerScreenState extends State<ScannerScreen>
             MobileScanner(
               controller: _controller!,
               onDetect: _onBarcodeDetected,
-              errorBuilder: (context, error, child) {
+              errorBuilder: (context, error) {
                 return Center(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -313,8 +424,7 @@ class _ScannerScreenState extends State<ScannerScreen>
           ),
 
           // ── Loading overlay ────────────────────────────────────────────
-          if (_isProcessing)
-            const LoadingOverlay(message: 'กำลังค้นหา Asset…'),
+          if (_isProcessing) const LoadingOverlay(message: 'กำลังค้นหา Asset…'),
         ],
       ),
     );
@@ -408,8 +518,7 @@ class _ScanOverlay extends StatelessWidget {
             ),
           ]),
         ),
-        Positioned(
-            top: top, left: left, child: _CornerFrame(size: windowSize)),
+        Positioned(top: top, left: left, child: _CornerFrame(size: windowSize)),
         Positioned(
           top: top + 4,
           left: left + 4,
@@ -508,8 +617,8 @@ class _Corner extends StatelessWidget {
   Widget build(BuildContext context) => SizedBox(
         width: length,
         height: length,
-        child: CustomPaint(
-            painter: _CornerPainter(stroke: stroke, color: color)),
+        child:
+            CustomPaint(painter: _CornerPainter(stroke: stroke, color: color)),
       );
 }
 
@@ -554,8 +663,7 @@ class _BottomPanel extends StatelessWidget {
     return Container(
       decoration: BoxDecoration(
         color: AppConstants.primaryNavy.withOpacity(0.92),
-        borderRadius:
-            const BorderRadius.vertical(top: Radius.circular(20)),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
       ),
       padding: EdgeInsets.fromLTRB(
           20, 20, 20, MediaQuery.paddingOf(context).bottom + 20),
@@ -568,8 +676,8 @@ class _BottomPanel extends StatelessWidget {
               decoration: BoxDecoration(
                 color: AppConstants.accentRed.withOpacity(0.15),
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                    color: AppConstants.accentRed.withOpacity(0.4)),
+                border:
+                    Border.all(color: AppConstants.accentRed.withOpacity(0.4)),
               ),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -580,9 +688,7 @@ class _BottomPanel extends StatelessWidget {
                   Expanded(
                     child: Text(error!,
                         style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 13,
-                            height: 1.5)),
+                            color: Colors.white, fontSize: 13, height: 1.5)),
                   ),
                   IconButton(
                     icon: const Icon(Icons.close,

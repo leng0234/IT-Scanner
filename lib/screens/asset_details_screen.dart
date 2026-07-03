@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:html_unescape/html_unescape.dart';
 import 'package:intl/intl.dart';
 
 import '../models/activity_model.dart';
@@ -10,6 +11,27 @@ import '../widgets/signature_dialog.dart';
 // EDIT FEATURE DISABLED: ไม่ใช้แล้วเพราะ flow ออกแบบให้แก้ asset ไม่ได้หลังสร้าง
 // ถ้าต้องการเปิดใช้อีกครั้ง ให้ uncomment บรรทัดนี้ และจุดอื่นๆ ที่ comment ไว้ด้านล่าง
 // import 'edit_asset_screen.dart';
+
+// Snipe-IT returns custom-field values HTML-escaped (e.g. 14" comes back
+// as `14&quot;`), so every value read via _cf() below is run through this
+// decoder — same as the PDF generator in signature_dialog.dart does.
+final HtmlUnescape _htmlUnescape = HtmlUnescape();
+
+/// Reads a Snipe-IT custom field value out of [AssetModel.customFields] by
+/// its exact field *name* (as configured in Snipe-IT, e.g. "RAM",
+/// "Storage Type", "S/N Monitor", "Type", "Warranty Period",
+/// "Warranty Provider"). Returns '—' when the field is missing/empty.
+///
+/// NOTE: the key must match the Snipe-IT field name exactly (case + spacing).
+/// If a field shows '—' here even though you filled it in on the Fieldset,
+/// double check the exact label used in Snipe-IT's "Custom Fields" admin.
+String _cf(AssetModel asset, String key) {
+  final field = (asset.customFields ?? {})[key];
+  if (field == null) return '—';
+  final raw = field['value']?.toString();
+  if (raw == null || raw.trim().isEmpty) return '—';
+  return _htmlUnescape.convert(raw);
+}
 
 class AssetDetailsScreen extends StatefulWidget {
   final AssetModel asset;
@@ -425,6 +447,29 @@ class _DetailsTab extends StatelessWidget {
           ),
         ),
 
+        // ── Specifications (from the "Laptop Field Set" custom fields) ──────
+        const SectionHeader(title: 'Specifications'),
+        Card(
+          child: Column(
+            children: [
+              InfoRow(label: 'RAM', value: _cf(asset, 'RAM')),
+              const CardDivider(),
+              InfoRow(
+                label: 'Storage',
+                value:
+                    '${_cf(asset, 'Storage Type')} ${_cf(asset, 'Capacity')}'
+                        .trim(),
+              ),
+              const CardDivider(),
+              InfoRow(label: 'Type', value: _cf(asset, 'Type')),
+              const CardDivider(),
+              InfoRow(label: 'Monitor', value: _cf(asset, 'Monitor')),
+              const CardDivider(),
+              InfoRow(label: 'Monitor S/N', value: _cf(asset, 'S/N Monitor')),
+            ],
+          ),
+        ),
+
         const SectionHeader(title: 'Assignment'),
         Card(
           child: Column(
@@ -473,6 +518,13 @@ class _DetailsTab extends StatelessWidget {
                     : null,
                 value: asset.warrantyExpires == null ? '—' : null,
               ),
+              const CardDivider(),
+              InfoRow(
+                  label: 'Warranty Period', value: _cf(asset, 'Warranty Period')),
+              const CardDivider(),
+              InfoRow(
+                  label: 'Warranty Provider',
+                  value: _cf(asset, 'Warranty Provider')),
               const CardDivider(),
               InfoRow(label: 'Last Updated', value: asset.updatedAt),
             ],

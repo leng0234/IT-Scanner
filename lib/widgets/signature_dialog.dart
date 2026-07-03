@@ -2,6 +2,8 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'dart:convert';
 import 'dart:async';
+import 'package:http/http.dart' as http;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 import 'package:crypto/crypto.dart'; // real cryptographic hashing
 import 'package:flutter/foundation.dart' show debugPrint;
@@ -39,6 +41,55 @@ import 'pdf_downloader_stub.dart'
 // `asset.category?.name`, falling back to `asset.model?.name` if the
 // category wasn't returned by the API. Requires `AssetModel.category`
 // (see asset_model.dart) — make sure that field is present in your model.
+//
+// NOTE (custom fields used below): the "Laptop Field Set" you configured in
+// Snipe-IT exposes RAM / Storage Type / Capacity / Monitor / S/N Monitor /
+// Type / Warranty Period / Warranty Provider as custom fields, all read via
+// `getField('<exact field name>')` further down. If any of these render as
+// '—' on the PDF, double-check the field name typed here matches the label
+// in Snipe-IT's Custom Fields admin exactly (case + spacing).
+//
+// `PO Number`, `Object ID` and `IP Address` are also pulled the same way —
+// add those as custom fields too (if not already present) so they populate
+// on the printed form; otherwise they'll simply print as '—'.
+
+/// Snapshot of a *prior* checkout's signature/recipient info, so that when
+/// generating a check**in** PDF, the checkout box on the same page can be
+/// filled in instead of printing blank.
+///
+/// FUTURE WIRING (not implemented yet — storage isn't built): before calling
+/// `showSignatureDialog(isCheckOut: false, ...)`, look up the saved checkout
+/// record for this asset (by asset tag/id) from storage and build one of
+/// these from it, e.g.:
+///
+/// ```dart
+/// final saved = await storage.getCheckoutRecord(asset.id!);
+/// final prior = saved == null
+///     ? null
+///     : PriorCheckoutRecord(
+///         assigneeName: saved.assigneeName,
+///         division: saved.division,
+///         dateStr: saved.dateStr,
+///         sigBytes: saved.signaturePngBytes,
+///       );
+/// ```
+///
+/// Until that lookup exists, just pass `null` (the default) — the checkout
+/// box on the checkin PDF will print as an empty "ยังไม่มีลายเซ็น" placeholder
+/// instead of failing.
+class PriorCheckoutRecord {
+  final String assigneeName;
+  final String? division;
+  final String dateStr;
+  final Uint8List sigBytes;
+
+  const PriorCheckoutRecord({
+    required this.assigneeName,
+    this.division,
+    required this.dateStr,
+    required this.sigBytes,
+  });
+}
 
 Future<Uint8List?> showSignatureDialog({
   required BuildContext context,
@@ -48,6 +99,10 @@ Future<Uint8List?> showSignatureDialog({
   String? assigneeName,
   String? division,
   bool isCheckOut = true,
+  // Pass this on checkin so the generated PDF shows both the checkout and
+  // checkin signature boxes on one page. Leave null for checkout, or for
+  // checkin until the storage lookup described above is wired up.
+  PriorCheckoutRecord? priorCheckout,
 }) {
   return showDialog<Uint8List?>(
     context: context,
@@ -59,12 +114,12 @@ Future<Uint8List?> showSignatureDialog({
       assigneeName: assigneeName,
       division: division,
       isCheckOut: isCheckOut,
+      priorCheckout: priorCheckout,
     ),
   );
 }
 
-/// Centralized layout/format constants (FIX #7: no more magic numbers
-/// scattered through the PDF-building code).
+/// Centralized layout/format constants.
 class _PdfLayoutConstants {
   static const double canvasWidth = 600;
   static const double canvasHeight = 300;
@@ -77,7 +132,7 @@ class _PdfLayoutConstants {
 // class here, so it's shared with the rest of the app and only needs to
 // change in one place.
 
-/// FIX #8: Font bytes are loaded once and cached at the class (static)
+/// Font bytes are loaded once and cached at the class (static)
 /// level instead of being re-read from the asset bundle on every single
 /// checkout/checkin PDF generation.
 ///
@@ -104,14 +159,13 @@ class _FontCache {
       final data = await rootBundle.load(assetPath);
       return pw.Font.ttf(data);
     } catch (e, st) {
-      // FIX #3: log instead of swallowing the error silently.
       debugPrint('=== [FontCache] Failed to load $assetPath: $e\n$st');
       return null;
     }
   }
 }
 
-/// FIX #1 + #2: Real SHA-256 based document verification, computed over the
+/// Real SHA-256 based document verification, computed over the
 /// *entire* signature image (not just the first 32 bytes, which are mostly
 /// constant PNG header bytes and don't meaningfully distinguish signatures).
 ///
@@ -156,6 +210,7 @@ class _SignatureDialog extends StatefulWidget {
   final String? assigneeName;
   final String? division;
   final bool isCheckOut;
+  final PriorCheckoutRecord? priorCheckout;
 
   const _SignatureDialog({
     required this.title,
@@ -164,18 +219,14 @@ class _SignatureDialog extends StatefulWidget {
     this.assigneeName,
     this.division,
     this.isCheckOut = true,
+    this.priorCheckout,
   });
 
   @override
   State<_SignatureDialog> createState() => _SignatureDialogState();
 }
 
-/// FIX: `_tableHeader` used to take its `ts` parameter as an inline
-/// generalized function type (`required pw.TextStyle Function({...}) ts`).
-/// With several named parameters nested inside, some Dart analyzer versions
-/// mis-parse that inline form and incorrectly report the `pw` import prefix
-/// as "shadowed by a local declaration". Pulling the signature out into a
-/// standalone typedef avoids the inline nesting entirely and resolves it.
+/// Standalone typedef for avoiding inline nesting issues on some Dart analyzers.
 typedef _PdfTextStyleBuilder = pw.TextStyle Function({
   double size,
   pw.Font? font,
@@ -211,10 +262,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
   }
 
   // ── HTML entity decoder ────────────────────────────────────────────────────
-  // FIX #2: was a long hand-rolled chain of replaceAll() calls covering only
-  // a dozen named entities. html_unescape covers the full named-entity table
-  // plus numeric (&#NN;) and hex (&#xNN;) entities, and is one line to use.
-
   static final HtmlUnescape _htmlUnescape = HtmlUnescape();
 
   String _decodeHtmlEntities(String input) => _htmlUnescape.convert(input);
@@ -225,20 +272,15 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     Uint8List? pngBytes;
 
     try {
-      pngBytes = await _controller.toPngBytes(
-        height: _PdfLayoutConstants.canvasHeight.toInt(),
-        width: _PdfLayoutConstants.canvasWidth.toInt(),
-      );
+      // FIX: ถอดการล็อกขนาดกว้างคูณสูงตายตัวออก เพื่อดึงค่าพิกัดความละเอียดจริงตามหน้าจอ (Natural Size) ลายเซ็นจะไม่โดนตัดขอบขวาอีกต่อไป
+      pngBytes = await _controller.toPngBytes();
     } catch (e, st) {
       debugPrint('=== [Signature] toPngBytes failed: $e\n$st');
     }
 
     if (pngBytes == null || pngBytes.isEmpty) {
       try {
-        final image = await _controller.toImage(
-          height: _PdfLayoutConstants.canvasHeight.toInt(),
-          width: _PdfLayoutConstants.canvasWidth.toInt(),
-        );
+        final image = await _controller.toImage();
         if (image != null) {
           final byteData =
               await image.toByteData(format: ui.ImageByteFormat.png);
@@ -250,16 +292,24 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     }
 
     if (pngBytes == null || pngBytes.isEmpty) {
-      // FIX #4: manual canvas fallback now draws connected strokes
-      // (a Path through consecutive points) instead of disconnected dots,
-      // so the resulting signature actually looks like what was drawn.
+      // FIX: ปรับ Manual Canvas Fallback ให้คำนวณพื้นที่ความกว้างลึกจริงจากจุดพิกัดการลากเส้น เพื่อไม่ให้สัดส่วนบีบอัดจนขาดตอน
       try {
-        const w = _PdfLayoutConstants.canvasWidth;
-        const h = _PdfLayoutConstants.canvasHeight;
+        double maxX = 0;
+        double maxY = 0;
+        for (final point in _controller.points) {
+          if (point != null) {
+            if (point.offset.dx > maxX) maxX = point.offset.dx;
+            if (point.offset.dy > maxY) maxY = point.offset.dy;
+          }
+        }
+
+        final w = (maxX + 20).clamp(300.0, 2000.0);
+        final h = (maxY + 20).clamp(220.0, 2000.0);
+
         final recorder = ui.PictureRecorder();
-        final canvas = Canvas(recorder, const Rect.fromLTWH(0, 0, w, h));
+        final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, w, h));
         canvas.drawRect(
-            const Rect.fromLTWH(0, 0, w, h), Paint()..color = Colors.white);
+            Rect.fromLTWH(0, 0, w, h), Paint()..color = Colors.white);
         final paint = Paint()
           ..color = AppConstants.primaryNavy
           ..strokeWidth = 3.5
@@ -270,15 +320,12 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         Offset? previous;
         for (final point in _controller.points) {
           if (point == null) {
-            // null marks a pen-up / new-stroke boundary.
             previous = null;
             continue;
           }
           if (previous != null) {
             canvas.drawLine(previous, point.offset, paint);
           } else {
-            // Single isolated point (e.g. a tap/dot): draw a small filled
-            // circle so it's still visible even with no line to connect.
             canvas.drawCircle(
               point.offset,
               1.75,
@@ -383,13 +430,577 @@ class _SignatureDialogState extends State<_SignatureDialog> {
   }
 
   // ── Generate & download PDF ────────────────────────────────────────────────
+  // ── Upload PDF to Snipe-IT ────────────────────────────────────────────────
+  //
+  // FIX (env keys): previously this read `dotenv.env['http://192.168.89.10']`
+  // and `dotenv.env['eyJ...<jwt>...']` — i.e. it used the *actual values* as
+  // the lookup *keys*, which can never match anything in a real .env file
+  // (whose keys are names like SNIPEIT_BASE_URL=...). That made both lookups
+  // return null every time, so the upload always failed before a single
+  // HTTP request was even sent. Now it reads by proper key name.
+  //
+  // FIX (silent-fail upload): Snipe-IT's /hardware/{id}/files endpoint can
+  // return HTTP 200 while the JSON body itself says `"status": "error"`
+  // (e.g. wrong field name, missing permission, bad asset id). The old code
+  // only checked `response.statusCode != 200`, so those in-body errors were
+  // treated as success and the app reported "uploaded" while Snipe-IT never
+  // actually stored a file. Now the JSON body's `status` field is checked
+  // too, and the multipart field name uses `file[]` (array form), which is
+  // what Snipe-IT's file upload endpoint expects.
+  Future<void> _uploadPdfToSnipeIT(
+      Uint8List pdfBytes, String action, AssetModel asset) async {
+    final assetId = asset.id;
+    if (assetId == null) {
+      throw Exception('Asset ID is missing. Cannot upload to Snipe-IT.');
+    }
+
+    // ดึงค่า URL และ Token จาก .env โดยอ้างอิงด้วย "ชื่อคีย์"
+    // ตั้งค่าใน .env ของโปรเจกต์ดังนี้:
+    //   SNIPEIT_BASE_URL=http://192.168.89.10
+    //   SNIPEIT_API_TOKEN=eyJ...(JWT token จาก Snipe-IT)
+    final baseUrl = dotenv.env['SNIPEIT_BASE_URL'];
+    final token = dotenv.env['SNIPEIT_API_TOKEN'];
+
+    if (baseUrl == null || baseUrl.isEmpty || token == null || token.isEmpty) {
+      throw Exception('Snipe-IT URL or Token not found in .env '
+          '(check keys SNIPEIT_BASE_URL / SNIPEIT_API_TOKEN)');
+    }
+
+    // สร้าง URL สำหรับ Endpoint Upload
+    final uri = Uri.parse('$baseUrl/api/v1/hardware/$assetId/files');
+
+    // ตั้งชื่อไฟล์
+    final now = DateTime.now();
+    final dateString =
+        '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
+    final fileName =
+        '${asset.assetTag ?? 'Asset'}_${widget.assigneeName ?? 'User'}_${dateString}_$action.pdf';
+
+    // สร้าง MultipartRequest
+    final request = http.MultipartRequest('POST', uri);
+    request.headers.addAll({
+      'Accept': 'application/json',
+      'Authorization': 'Bearer $token',
+    });
+
+    // แนบไฟล์ PDF — Snipe-IT API ใช้ field ชื่อ 'file[]' (array form)
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'file[]',
+        pdfBytes,
+        filename: fileName,
+      ),
+    );
+
+    // ใส่ Note แจ้งรายละเอียด (Optional)
+    request.fields['notes'] =
+        '$action document signed by ${widget.assigneeName ?? 'Unknown'}';
+
+    final streamedResponse = await request.send();
+    final respStr = await streamedResponse.stream.bytesToString();
+
+    debugPrint(
+        '=== [Upload] HTTP ${streamedResponse.statusCode}: $respStr');
+
+    // 1) ตรวจ HTTP status code ก่อน
+    if (streamedResponse.statusCode != 200) {
+      throw Exception(
+          'Failed to upload: HTTP ${streamedResponse.statusCode} - $respStr');
+    }
+
+    // 2) Snipe-IT อาจตอบ HTTP 200 พร้อม body ที่บอกว่า error จริง ๆ
+    //    (เช่น field ผิด / ไม่มีสิทธิ์ / asset id ไม่ถูกต้อง) ต้องเช็ค
+    //    "status" ใน JSON body ด้วย ไม่งั้นแอปจะรายงานว่าสำเร็จทั้งที่
+    //    ไม่มีไฟล์ถูกบันทึกจริงใน Snipe-IT
+    Map<String, dynamic> json;
+    try {
+      json = jsonDecode(respStr) as Map<String, dynamic>;
+    } catch (e) {
+      throw Exception('Unexpected response from Snipe-IT: $respStr');
+    }
+
+    final status = json['status']?.toString().toLowerCase();
+    if (status == 'error') {
+      final messages = json['messages'];
+      throw Exception('Snipe-IT rejected the upload: $messages');
+    }
+
+    debugPrint('=== [Upload] Success: PDF uploaded for Asset ID $assetId');
+  }
+
+  // ── Save checkout signature separately (for later reuse on checkin) ──────
+  //
+  // NEW FEATURE: when checking a device OUT, we additionally upload just the
+  // signature PNG (not the whole PDF) as its own small file attached to the
+  // asset, tagged with a recognizable filename marker
+  // (`_checkout_signature_<assetId>.png`) and with the recipient's
+  // name/division/date packed as JSON into that file's `notes` field.
+  //
+  // Later, when the SAME asset is checked back IN, `_fetchPriorCheckoutRecord`
+  // looks this file up and downloads it, so the "Receive" box on the checkin
+  // PDF is filled in automatically with the original checkout signature
+  // instead of printing "ยังไม่มีลายเซ็น" — no local storage needed, Snipe-IT
+  // itself is the storage.
+  //
+  // This is deliberately best-effort: if it fails, we only log it and move
+  // on, since a failure here must never block the checkout flow the user is
+  // actually waiting on.
+  //
+  // NOTE: this is now `await`-ed by the caller (see _generateAndDownloadPdf)
+  // instead of being fired-and-forgotten with `unawaited`. If the checkin
+  // flow can be started within a second or two of checkout completing, an
+  // un-awaited upload could still be in flight when
+  // _fetchPriorCheckoutRecord runs, making it look "missing" even though it
+  // would have succeeded a moment later.
+  Future<void> _uploadCheckoutSignatureToSnipeIT(
+    Uint8List sigBytes,
+    AssetModel asset,
+    String dateStr,
+  ) async {
+    final assetId = asset.id;
+    if (assetId == null) return;
+
+    final baseUrl = dotenv.env['SNIPEIT_BASE_URL'];
+    final token = dotenv.env['SNIPEIT_API_TOKEN'];
+    if (baseUrl == null || baseUrl.isEmpty || token == null || token.isEmpty) {
+      debugPrint(
+          '=== [CheckoutSignature Upload] skipped: missing .env config');
+      return;
+    }
+
+    try {
+      final uri = Uri.parse('$baseUrl/api/v1/hardware/$assetId/files');
+      final fileName = '_checkout_signature_$assetId.png';
+
+      final metaNotes = jsonEncode({
+        'assigneeName': widget.assigneeName ?? '—',
+        'division': widget.division,
+        'dateStr': dateStr,
+      });
+
+      final request = http.MultipartRequest('POST', uri);
+      request.headers.addAll({
+        'Accept': 'application/json',
+        'Authorization': 'Bearer $token',
+      });
+      request.files.add(
+        http.MultipartFile.fromBytes('file[]', sigBytes, filename: fileName),
+      );
+      request.fields['notes'] = metaNotes;
+
+      final streamed = await request.send();
+      final body = await streamed.stream.bytesToString();
+      debugPrint(
+          '=== [CheckoutSignature Upload] HTTP ${streamed.statusCode}: $body');
+    } catch (e, st) {
+      debugPrint('=== [CheckoutSignature Upload] error: $e\n$st');
+    }
+  }
+
+  // ── Look up the checkout signature saved above (for checkin PDFs) ────────
+  //
+  // CONFIRMED RESPONSE SHAPE (from live debug log on 2026-07-03): Snipe-IT's
+  // file-listing calls (both the upload response and — per Snipe-IT's API
+  // convention of reusing the same list wrapper — the dedicated files list
+  // endpoint) return:
+  //   { "status": "success", "payload": { "total": N, "rows": [ {
+  //       "id": 66, "filename": "...", "note": "...", ...
+  //   } ] } }
+  // Two things differ from a first guess: the files live under
+  // `GET /hardware/{id}/files` (NOT embedded in the plain asset-detail
+  // response), and the per-file note key is `note` (singular), not `notes`.
+  // Both are handled below; a couple of alternate shapes are still checked
+  // as a fallback in case of version differences, so this degrades to
+  // returning null (blank checkout box, same as before) instead of crashing
+  // if your instance differs further.
+  //
+  // FIX (matching logic): confirmed via live log on 2026-07-03 that
+  // Snipe-IT renames every uploaded file on its own — it prefixes
+  // "asset-{id}-{randomhash}-" and converts underscores to hyphens (e.g.
+  // our "checkin" PDF upload, sent with underscores in the filename, came
+  // back stored as "asset-8-OYTSzdEk-...-checkin.pdf"). That means the
+  // checkout-signature file, uploaded as "_checkout_signature_{id}.png",
+  // does NOT keep that exact substring once Snipe-IT stores it — matching
+  // on `.contains('_checkout_signature_')` therefore always failed, even
+  // though the file had uploaded successfully. Matching is now done
+  // primarily via the `note` JSON payload (which we control and Snipe-IT
+  // does not rewrite), with a looser, separator-agnostic filename check as
+  // a fallback.
+  // ── Delete a single hardware file, trying known route variants ───────────
+  //
+  // Snipe-IT's delete-file API route has changed shape across versions —
+  // some expose `DELETE /hardware/{id}/files/{file_id}`, others
+  // `DELETE /hardware/{id}/files/{file_id}/delete`, and some only accept a
+  // POST with Laravel's `_method=DELETE` spoofing field. Both plain DELETE
+  // variants returned HTTP 405 on this install (confirmed via live log on
+  // 2026-07-03), so rather than hardcode one guess, this tries each known
+  // variant in turn and stops at the first one that isn't rejected as
+  // wrong-method/not-found. Logs every attempt so the working variant (or
+  // the fact that none worked) is visible in debug output.
+  Future<void> _deleteSnipeItFile(
+    String baseUrl,
+    Map<String, String> headers,
+    int assetId,
+    int fileId,
+  ) async {
+    final attempts = <Future<http.Response> Function()>[
+      // 1) DELETE .../files/{id}/delete
+      () => http.delete(
+          Uri.parse('$baseUrl/api/v1/hardware/$assetId/files/$fileId/delete'),
+          headers: headers),
+      // 2) DELETE .../files/{id}  (no /delete suffix)
+      () => http.delete(
+          Uri.parse('$baseUrl/api/v1/hardware/$assetId/files/$fileId'),
+          headers: headers),
+      // 3) POST .../files/{id}/delete  with Laravel's _method=DELETE
+      //    spoofing field, for installs where the route only accepts POST.
+      () => http.post(
+          Uri.parse('$baseUrl/api/v1/hardware/$assetId/files/$fileId/delete'),
+          headers: headers,
+          body: {'_method': 'DELETE'}),
+      // 4) POST .../files/{id}  with the same spoofing field, in case the
+      //    "/delete" suffix isn't part of this install's route at all.
+      () => http.post(
+          Uri.parse('$baseUrl/api/v1/hardware/$assetId/files/$fileId'),
+          headers: headers,
+          body: {'_method': 'DELETE'}),
+    ];
+
+    for (var i = 0; i < attempts.length; i++) {
+      try {
+        final resp = await attempts[i]();
+        debugPrint('=== [DeleteCheckoutArtifacts] file $fileId attempt '
+            '${i + 1}/${attempts.length}: HTTP ${resp.statusCode} '
+            '${resp.body}');
+
+        // 405/404 mean this route shape doesn't exist here — try the next
+        // variant. Anything else (200 with status success, or a real
+        // permission/validation error) is a definitive result — stop.
+        if (resp.statusCode == 405 || resp.statusCode == 404) {
+          continue;
+        }
+
+        if (resp.statusCode == 200) {
+          try {
+            final body = jsonDecode(resp.body) as Map<String, dynamic>;
+            if (body['status']?.toString().toLowerCase() == 'error') {
+              debugPrint('=== [DeleteCheckoutArtifacts] file $fileId '
+                  'rejected by server: ${body['messages']}');
+            } else {
+              debugPrint(
+                  '=== [DeleteCheckoutArtifacts] file $fileId deleted '
+                  '(variant ${i + 1})');
+            }
+          } catch (_) {
+            // Non-JSON 200 body — treat as success and stop trying.
+          }
+        }
+        return;
+      } catch (e, st) {
+        debugPrint('=== [DeleteCheckoutArtifacts] file $fileId attempt '
+            '${i + 1} threw: $e\n$st');
+      }
+    }
+
+    debugPrint('=== [DeleteCheckoutArtifacts] file $fileId: all delete '
+        'route variants failed (405/404) — check `php artisan route:list '
+        '--path=files` on the server to find the correct route for this '
+        'install.');
+  }
+
+  Future<PriorCheckoutRecord?> _fetchPriorCheckoutRecord(int assetId) async {
+    final baseUrl = dotenv.env['SNIPEIT_BASE_URL'];
+    final token = dotenv.env['SNIPEIT_API_TOKEN'];
+    if (baseUrl == null || baseUrl.isEmpty || token == null || token.isEmpty) {
+      return null;
+    }
+
+    final headers = {
+      'Accept': 'application/json',
+      'Authorization': 'Bearer $token',
+    };
+
+    try {
+      // 1) List files attached to this asset via the dedicated files
+      //    endpoint (this is what actually holds them — the plain asset
+      //    detail endpoint does not).
+      final filesUri = Uri.parse('$baseUrl/api/v1/hardware/$assetId/files');
+      final filesResp = await http.get(filesUri, headers: headers);
+      if (filesResp.statusCode != 200) {
+        debugPrint('=== [PriorCheckout] failed to fetch files list: '
+            'HTTP ${filesResp.statusCode}');
+        return null;
+      }
+
+      final filesJson = jsonDecode(filesResp.body) as Map<String, dynamic>;
+      // Try the confirmed shape first (payload.rows), then a couple of
+      // fallbacks in case of version differences.
+      final rawFiles = (filesJson['payload'] is Map
+              ? (filesJson['payload'] as Map)['rows']
+              : null) ??
+          filesJson['rows'] ??
+          filesJson['uploads'] ??
+          filesJson['files'];
+      if (rawFiles is! List || rawFiles.isEmpty) {
+        debugPrint('=== [PriorCheckout] no files found in response: '
+            '${filesResp.body}');
+        return null;
+      }
+
+      // 2) Find our checkout-signature marker file.
+      //
+      //    Primary match: the `note` field, which is a JSON blob we wrote
+      //    ourselves in _uploadCheckoutSignatureToSnipeIT (it contains an
+      //    `assigneeName` key). Snipe-IT stores notes verbatim, unlike
+      //    filenames, so this survives intact and is the reliable signal.
+      //
+      //    Fallback match: filename contains both "checkout" and
+      //    "signature" (case-insensitive), regardless of whether Snipe-IT
+      //    rewrote separators as underscores or hyphens.
+      //
+      //    If several matches exist (from multiple past checkouts), take
+      //    the most recently uploaded one (highest file id).
+      Map<String, dynamic>? match;
+      for (final f in rawFiles) {
+        if (f is! Map) continue;
+
+        bool isOurs = false;
+
+        final noteValue = (f['note'] ?? f['notes'])?.toString();
+        if (noteValue != null && noteValue.isNotEmpty) {
+          try {
+            // FIX: Snipe-IT HTML-encodes stored note text (e.g. `"`
+            // becomes `&quot;`), same as it does for custom field values
+            // elsewhere in this file. jsonDecode on the raw, still-encoded
+            // string throws (the payload looks like
+            // `{&quot;assigneeName&quot;:...}`, not valid JSON), so this
+            // match — and, more importantly, the field extraction in step
+            // 4 below — silently failed and fell back to defaults. Decode
+            // entities first so the JSON is well-formed again.
+            final meta = jsonDecode(_decodeHtmlEntities(noteValue))
+                as Map<String, dynamic>;
+            if (meta.containsKey('assigneeName')) {
+              isOurs = true;
+            }
+          } catch (_) {
+            // Not our JSON note (e.g. the main PDF's "X document signed by
+            // Y" sentence, or a manually edited note) — not a match.
+          }
+        }
+
+        if (!isOurs) {
+          final name = (f['filename'] ?? f['file_name'] ?? f['name'] ?? '')
+              .toString()
+              .toLowerCase();
+          if (name.contains('checkout') && name.contains('signature')) {
+            isOurs = true;
+          }
+        }
+
+        if (isOurs) {
+          final fId = (f['id'] as num?) ?? 0;
+          final matchId = (match?['id'] as num?) ?? -1;
+          if (match == null || fId > matchId) {
+            match = Map<String, dynamic>.from(f);
+          }
+        }
+      }
+
+      if (match == null) {
+        debugPrint('=== [PriorCheckout] no checkout-signature file found '
+            'among ${rawFiles.length} file(s)');
+        return null;
+      }
+
+      final fileId = match['id'];
+      if (fileId == null) return null;
+
+      // 3) Download the actual PNG bytes.
+      final fileUri =
+          Uri.parse('$baseUrl/api/v1/hardware/$assetId/files/$fileId');
+      final fileResp = await http.get(fileUri, headers: headers);
+      if (fileResp.statusCode != 200 || fileResp.bodyBytes.isEmpty) {
+        debugPrint('=== [PriorCheckout] failed to download file $fileId: '
+            'HTTP ${fileResp.statusCode}');
+        return null;
+      }
+
+      // 4) Recover assignee/division/date, packed as JSON into the file's
+      //    note when it was uploaded (see _uploadCheckoutSignatureToSnipeIT
+      //    above). Snipe-IT returns this back as `note` (singular) even
+      //    though the upload field is named `notes` — check both.
+      String? assigneeName;
+      String? division;
+      String? dateStr;
+      final noteValue = (match['note'] ?? match['notes'])?.toString();
+      if (noteValue != null && noteValue.isNotEmpty) {
+        try {
+          // FIX: decode HTML entities before parsing — see the matching
+          // comment in the isOurs check above. This is the fix that
+          // actually restores the checkout date on the checkin PDF: this
+          // extraction step is what populates `dateStr`, and it has no
+          // fallback other than the literal '—', unlike assigneeName /
+          // division which happen to fall back to the checkin person's own
+          // values (often the same person, masking the bug there).
+          final meta = jsonDecode(_decodeHtmlEntities(noteValue))
+              as Map<String, dynamic>;
+          assigneeName = meta['assigneeName']?.toString();
+          division = meta['division']?.toString();
+          dateStr = meta['dateStr']?.toString();
+        } catch (_) {
+          // note wasn't our JSON payload (e.g. edited manually) — ignore.
+        }
+      }
+
+      return PriorCheckoutRecord(
+        assigneeName: assigneeName ?? widget.assigneeName ?? '—',
+        division: division ?? widget.division,
+        dateStr: dateStr ?? '—',
+        sigBytes: fileResp.bodyBytes,
+      );
+    } catch (e, st) {
+      debugPrint('=== [PriorCheckout] lookup failed: $e\n$st');
+      return null;
+    }
+  }
+
+  // ── Clean up checkout artifacts once checked back in ──────────────────────
+  //
+  // NEW FEATURE: after a successful CHECKIN, delete the two files that were
+  // uploaded during the matching CHECKOUT — the checkout PDF (see
+  // _uploadPdfToSnipeIT) and the standalone checkout-signature PNG (see
+  // _uploadCheckoutSignatureToSnipeIT) — so Snipe-IT ends up holding just
+  // this one checkin PDF instead of accumulating a growing pile of files
+  // (checkout PDF + signature PNG + checkin PDF) every checkout/checkin
+  // cycle.
+  //
+  // Identification mirrors _fetchPriorCheckoutRecord's matching logic:
+  //   - Checkout signature PNG: `note` decodes (after HTML-entity
+  //     unescaping — see the fix in _fetchPriorCheckoutRecord) to JSON
+  //     containing an `assigneeName` key, which only our checkout-signature
+  //     uploads ever write.
+  //   - Checkout PDF: `note` is the plain sentence written by
+  //     _uploadPdfToSnipeIT, i.e. "Checkout document signed by <name>".
+  // Both fall back to a looser, separator-agnostic filename check (Snipe-IT
+  // renames files on its own — see the note in _fetchPriorCheckoutRecord)
+  // in case the note itself is missing or was edited.
+  //
+  // Deliberately best-effort: this only runs *after* the checkin PDF has
+  // already uploaded successfully, so a failure here (network hiccup,
+  // missing delete permission, etc.) must never surface as a failed
+  // checkin — it's just log-and-move-on cleanup. Worst case, the old files
+  // are simply left behind for manual cleanup.
+  Future<void> _deleteCheckoutArtifacts(int assetId) async {
+    final baseUrl = dotenv.env['SNIPEIT_BASE_URL'];
+    final token = dotenv.env['SNIPEIT_API_TOKEN'];
+    if (baseUrl == null || baseUrl.isEmpty || token == null || token.isEmpty) {
+      debugPrint(
+          '=== [DeleteCheckoutArtifacts] skipped: missing .env config');
+      return;
+    }
+
+    final headers = {
+      'Accept': 'application/json',
+      'Authorization': 'Bearer $token',
+    };
+
+    try {
+      final filesUri = Uri.parse('$baseUrl/api/v1/hardware/$assetId/files');
+      final filesResp = await http.get(filesUri, headers: headers);
+      if (filesResp.statusCode != 200) {
+        debugPrint('=== [DeleteCheckoutArtifacts] failed to fetch files '
+            'list: HTTP ${filesResp.statusCode}');
+        return;
+      }
+
+      final filesJson = jsonDecode(filesResp.body) as Map<String, dynamic>;
+      final rawFiles = (filesJson['payload'] is Map
+              ? (filesJson['payload'] as Map)['rows']
+              : null) ??
+          filesJson['rows'] ??
+          filesJson['uploads'] ??
+          filesJson['files'];
+      if (rawFiles is! List || rawFiles.isEmpty) {
+        debugPrint(
+            '=== [DeleteCheckoutArtifacts] no files found for asset $assetId');
+        return;
+      }
+
+      final idsToDelete = <int>[];
+
+      for (final f in rawFiles) {
+        if (f is! Map) continue;
+
+        final noteRaw = (f['note'] ?? f['notes'])?.toString() ?? '';
+        final noteDecoded = _decodeHtmlEntities(noteRaw);
+        final name = (f['filename'] ?? f['file_name'] ?? f['name'] ?? '')
+            .toString()
+            .toLowerCase();
+
+        // Checkout signature PNG: our JSON note marker.
+        var isCheckoutSignature = false;
+        try {
+          final meta = jsonDecode(noteDecoded) as Map<String, dynamic>;
+          if (meta.containsKey('assigneeName')) {
+            isCheckoutSignature = true;
+          }
+        } catch (_) {
+          // not our JSON note
+        }
+        if (!isCheckoutSignature &&
+            name.contains('checkout') &&
+            name.contains('signature')) {
+          isCheckoutSignature = true;
+        }
+
+        // Checkout PDF: plain-sentence note written by _uploadPdfToSnipeIT.
+        // Explicitly excludes "checkin" filenames so a checkin PDF whose
+        // sanitized name happens to also contain "checkout" as a substring
+        // (it shouldn't, but be defensive) is never swept up here.
+        final isCheckoutPdf = noteDecoded
+                .trim()
+                .toLowerCase()
+                .startsWith('checkout document signed by') ||
+            (name.contains('checkout') &&
+                name.endsWith('.pdf') &&
+                !name.contains('checkin'));
+
+        if (isCheckoutSignature || isCheckoutPdf) {
+          final fId = f['id'];
+          if (fId is num) idsToDelete.add(fId.toInt());
+        }
+      }
+
+      if (idsToDelete.isEmpty) {
+        debugPrint('=== [DeleteCheckoutArtifacts] nothing to delete for '
+            'asset $assetId');
+        return;
+      }
+
+      for (final fileId in idsToDelete) {
+        await _deleteSnipeItFile(baseUrl, headers, assetId, fileId);
+      }
+    } catch (e, st) {
+      debugPrint('=== [DeleteCheckoutArtifacts] error: $e\n$st');
+    }
+  }
 
   Future<void> _generateAndDownloadPdf(Uint8List sigBytes) async {
     final now = DateTime.now();
     final dateStr =
         '${now.day}/${now.month}/${now.year} ${now.hour}:${now.minute.toString().padLeft(2, '0')}';
+
     final asset = widget.asset!;
     final action = widget.isCheckOut ? 'Checkout' : 'Checkin';
+
+    // NEW: for a checkin, if the caller didn't already pass in a
+    // PriorCheckoutRecord, try to auto-recover the checkout signature/info
+    // we saved to Snipe-IT when this asset was checked out, so the
+    // "Receive" box on this checkin PDF isn't blank.
+    PriorCheckoutRecord? priorCheckout = widget.priorCheckout;
+    if (!widget.isCheckOut && priorCheckout == null && asset.id != null) {
+      priorCheckout = await _fetchPriorCheckoutRecord(asset.id!);
+    }
 
     final verifyCode = _DocumentVerification.generateVerificationCode(
       assetTag: asset.assetTag ?? '—',
@@ -411,7 +1022,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
 
     final qrPngBytes = await _generateQrPngBytes(qrData);
 
-    // FIX #8: use the cached fonts instead of reloading from disk every time.
     await _FontCache.ensureLoaded();
 
     // Logo
@@ -435,9 +1045,53 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       verifyCode: verifyCode,
       sarabunRegular: _FontCache.sarabunRegular,
       sarabunBold: _FontCache.sarabunBold,
+      priorCheckout: priorCheckout,
     );
 
-    await _downloadPdfFile(pdfBytes, action, now);
+    // Upload PDF ไปยัง Snipe-IT
+    try {
+      await _uploadPdfToSnipeIT(
+        pdfBytes,
+        action,
+        asset,
+      );
+
+      debugPrint('=== [Upload PDF] success');
+
+      // NEW: on a successful CHECKOUT, also stash just the signature PNG so
+      // a future checkin of this same asset can pull it back automatically
+      // (see _uploadCheckoutSignatureToSnipeIT / _fetchPriorCheckoutRecord
+      // above).
+      //
+      // FIX: this is now `await`-ed instead of `unawaited`. Best-effort
+      // still applies (failures here must never block the checkout the
+      // user is waiting on, and _uploadCheckoutSignatureToSnipeIT already
+      // swallows its own errors internally) — but firing it without
+      // awaiting meant a checkin started moments later could race the
+      // upload and find nothing yet, making a successful save look like a
+      // missing signature. Awaiting costs a few hundred ms (small PNG) and
+      // removes that race entirely.
+      if (widget.isCheckOut) {
+        await _uploadCheckoutSignatureToSnipeIT(sigBytes, asset, dateStr);
+      } else if (asset.id != null) {
+        // NEW: on a successful CHECKIN, remove the checkout PDF and the
+        // standalone checkout-signature PNG from this asset — see
+        // _deleteCheckoutArtifacts above. This runs only after the checkin
+        // PDF itself uploaded successfully, and never blocks or fails the
+        // checkin if cleanup has trouble.
+        await _deleteCheckoutArtifacts(asset.id!);
+      }
+    } catch (e, st) {
+      debugPrint('=== [Upload PDF] error: $e\n$st');
+
+      if (mounted) {
+        setState(() {
+          _exportError = 'PDF upload failed: $e';
+        });
+      }
+
+      rethrow;
+    }
   }
 
   // ── Build PDF ──────────────────────────────────────────────────────────────
@@ -454,6 +1108,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     String verifyCode = '',
     pw.Font? sarabunRegular,
     pw.Font? sarabunBold,
+    PriorCheckoutRecord? priorCheckout,
   }) async {
     String getField(String key) {
       final field = (asset.customFields ?? {})[key];
@@ -470,6 +1125,13 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final storageType = getField('Storage Type');
     final capacity = getField('Capacity');
     final monitor = getField('Monitor');
+    final monitorType = getField('Type');
+    final monitorSerial = getField('S/N Monitor');
+    final warrantyPeriod = getField('Warranty Period');
+    final warrantyProvider = getField('Warranty Provider');
+    final poNumber = getField('PO Number');
+    final objectId = getField('Object ID');
+    final ipAddress = getField('IP Address');
     final isCheckOut = widget.isCheckOut;
 
     const grey555 = PdfColor.fromInt(0xFF555555);
@@ -502,7 +1164,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       String? label2,
       String? value2,
       double minW1 = 80,
-      double minW2 = 40,
+      double minW2 = 68,
     }) {
       final children = <pw.Widget>[
         pw.SizedBox(
@@ -551,11 +1213,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     }
 
     final doc = pw.Document();
-
-    // FIX #7: _buildPdf was one 500+ line widget tree. Broken into small,
-    // named section builders below — each one focused on a single visual
-    // block of the document — so the page layout reads as a list of
-    // sections instead of one giant nested tree.
 
     pw.Widget buildHeader() {
       return pw.Row(
@@ -634,10 +1291,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
 
     pw.Widget buildHardwareSection() {
       return pw.Container(
-        // FIX: header used to have no border at all, so it visually
-        // "floated" disconnected from the bordered body box below it.
-        // Wrapping both in one outer container gives a single continuous
-        // border around the whole section.
         decoration: pw.BoxDecoration(
           border: pw.Border.all(width: 1.5),
         ),
@@ -658,12 +1311,18 @@ class _SignatureDialogState extends State<_SignatureDialog> {
               child: pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.stretch,
                 children: [
-                  fieldRow('Brand Name :', manufacturer,
-                      label2: 'Model :', value2: model, minW2: 40),
-                  fieldRow('S/N :', serial, minW1: 80),
-                  fieldRow('Harddisk :', '$storageType $capacity',
-                      label2: 'RAM :', value2: ram, minW2: 40),
-                  fieldRow('Monitor :', monitor),
+                  fieldRow('Name :', manufacturer,
+                      label2: 'Model :', value2: model),
+                  fieldRow('S/N :', serial, label2: 'RAM :', value2: ram),
+                  fieldRow('Harddisk :', '$storageType $capacity'.trim(),
+                      label2: 'Type :', value2: monitorType),
+                  fieldRow('Monitor :', monitor,
+                      label2: 'S/N :', value2: monitorSerial),
+                  fieldRow('Warranty (เครื่อง) :', warrantyPeriod,
+                      label2: 'Object ID :', value2: objectId),
+                  fieldRow('Warranty (บริษัทประกัน) :', warrantyProvider,
+                      label2: 'IP Address :', value2: ipAddress),
+                  fieldRow('PO Number :', poNumber, minW1: 80),
                   pw.Padding(
                     padding: const pw.EdgeInsets.only(bottom: 0),
                     child: pw.Row(
@@ -764,13 +1423,68 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       );
     }
 
+    pw.Widget buildSignatureCell({
+      required Uint8List? sigImageBytes,
+      required String? date,
+    }) {
+      final hasSig = sigImageBytes != null;
+      return pw.Container(
+        height: 110,
+        padding: const pw.EdgeInsets.all(8),
+        child: pw.Column(
+          mainAxisAlignment: pw.MainAxisAlignment.end,
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            pw.Expanded(
+              child: hasSig
+                  ? pw.Align(
+                      alignment: pw.Alignment.center,
+                      child: pw.Image(
+                        pw.MemoryImage(sigImageBytes),
+                        height: 45,
+                        fit: pw.BoxFit.contain,
+                      ),
+                    )
+                  : pw.Center(
+                      child: pw.Text('ยังไม่มีลายเซ็น',
+                          style: ts(size: 8, color: PdfColors.grey400)),
+                    ),
+            ),
+            pw.Divider(color: PdfColors.grey300, thickness: 0.5, height: 6),
+            pw.Row(
+              children: [
+                pw.Text('Date  ', style: ts(size: 8, font: boldFont)),
+                pw.Expanded(
+                  child:
+                      pw.Text(hasSig ? (date ?? '—') : '', style: ts(size: 9)),
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+    }
+
     pw.Widget buildSignatureSection() {
+      final checkoutName =
+          isCheckOut ? assigneeName : priorCheckout?.assigneeName;
+      final checkoutDivision = isCheckOut ? division : priorCheckout?.division;
+      final checkoutDate = isCheckOut ? dateStr : priorCheckout?.dateStr;
+      final checkoutSig = isCheckOut ? sigBytes : priorCheckout?.sigBytes;
+
+      final checkinDate = isCheckOut ? null : dateStr;
+      final checkinSig = isCheckOut ? null : sigBytes;
+
+      final displayName = checkoutName ?? assigneeName;
+      final displayDivision = checkoutDivision ?? division;
+
       return pw.Table(
         border: pw.TableBorder.all(width: 1.5),
         columnWidths: {
-          0: const pw.FlexColumnWidth(2.5),
-          1: const pw.FlexColumnWidth(1.5),
-          2: const pw.FlexColumnWidth(3),
+          0: const pw.FlexColumnWidth(2.2),
+          1: const pw.FlexColumnWidth(1.3),
+          2: const pw.FlexColumnWidth(2.5),
+          3: const pw.FlexColumnWidth(2.5),
         },
         children: [
           pw.TableRow(
@@ -778,58 +1492,41 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             children: [
               _tableHeader('Name', boldFont: boldFont, ts: ts),
               _tableHeader('Division', boldFont: boldFont, ts: ts),
-              _tableHeader('Received Date / Signature',
-                  boldFont: boldFont, ts: ts),
+              _tableHeader('Receive', boldFont: boldFont, ts: ts),
+              _tableHeader('Return', boldFont: boldFont, ts: ts),
             ],
           ),
           pw.TableRow(
             children: [
-              // Name: horizontal-center only, vertical position unchanged (top, default)
               pw.Padding(
-                padding: const pw.EdgeInsets.all(8),
-                child: pw.Text(
-                  assigneeName,
-                  style: ts(font: boldFont),
-                  textAlign: pw.TextAlign.center,
-                ),
-              ),
-              // Division: horizontal-center only, vertical position unchanged (top, default)
-              pw.Padding(
-                padding: const pw.EdgeInsets.all(8),
-                child: pw.Text(
-                  division,
-                  style: ts(),
-                  textAlign: pw.TextAlign.center,
-                ),
-              ),
-              // Signature: fixed-height wrapper so the row stretches to this
-              // height, then Align(center) centers the block both ways inside it.
-              pw.Container(
-                height: 100,
                 padding: const pw.EdgeInsets.all(8),
                 child: pw.Align(
-                  alignment: pw.Alignment.centerLeft,
-                  child: pw.Column(
-                    mainAxisSize: pw.MainAxisSize.min,
-                    crossAxisAlignment: pw.CrossAxisAlignment.start,
-                    children: [
-                      pw.Container(
-                        width: 150,
-                        height: 55,
-                        alignment: pw.Alignment
-                            .center, // signature image itself centered
-                        child: pw.Image(
-                          pw.MemoryImage(sigBytes),
-                          fit: pw.BoxFit.contain,
-                        ),
-                      ),
-                      pw.Divider(color: PdfColors.grey300, thickness: 0.5),
-                      pw.Text(assigneeName, style: ts(font: boldFont)),
-                      pw.SizedBox(height: 2),
-                      pw.Text(dateStr, style: ts(size: 9, color: grey555)),
-                    ],
+                  alignment: pw.Alignment.topCenter,
+                  child: pw.Text(
+                    displayName ?? '—',
+                    style: ts(font: boldFont),
+                    textAlign: pw.TextAlign.center,
                   ),
                 ),
+              ),
+              pw.Padding(
+                padding: const pw.EdgeInsets.all(8),
+                child: pw.Align(
+                  alignment: pw.Alignment.topCenter,
+                  child: pw.Text(
+                    displayDivision ?? '—',
+                    style: ts(),
+                    textAlign: pw.TextAlign.center,
+                  ),
+                ),
+              ),
+              buildSignatureCell(
+                sigImageBytes: checkoutSig,
+                date: checkoutDate,
+              ),
+              buildSignatureCell(
+                sigImageBytes: checkinSig,
+                date: checkinDate,
               ),
             ],
           ),
@@ -1003,32 +1700,38 @@ class _SignatureDialogState extends State<_SignatureDialog> {
   }
 
   // ── Download / share PDF ────────────────────────────────────────────────────
-  // FIX #9: platform-specific download/share behavior now lives entirely in
-  // pdf_downloader_stub.dart / pdf_downloader_web.dart / pdf_downloader_native.dart,
-  // selected at compile time via a conditional import. That's what actually
-  // makes web builds compile — a runtime `if (kIsWeb)` check alone doesn't
-  // stop the web compiler from trying (and failing) to resolve dart:io,
-  // path_provider, and share_plus.
+
+  String _sanitizeForFilename(String input) {
+    final cleaned = input
+        .trim()
+        .replaceAll(RegExp(r'[^\w\u0E00-\u0E7F]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    return cleaned.isEmpty ? 'Unknown' : cleaned;
+  }
 
   Future<void> _downloadPdfFile(
     Uint8List pdfBytes,
     String action,
     DateTime now,
+    AssetModel asset,
+    String assigneeName,
   ) async {
     final mm = now.month.toString().padLeft(2, '0');
     final dd = now.day.toString().padLeft(2, '0');
-    final hh = now.hour.toString().padLeft(2, '0');
-    final min = now.minute.toString().padLeft(2, '0');
+    final yyyy = now.year.toString();
 
-    final filename = '${action}_${now.year}$mm${dd}_$hh$min.pdf';
+    final tag = _sanitizeForFilename(asset.assetTag ?? 'Unknown');
+    final user = _sanitizeForFilename(assigneeName);
+    final actionLabel = action.toLowerCase();
+
+    final filename = '${tag}_${user}_$yyyy$mm${dd}_$actionLabel.pdf';
 
     try {
       await downloadOrSharePdf(pdfBytes, filename);
-
       debugPrint('=== [Download PDF] success: $filename');
     } catch (e, st) {
       debugPrint('=== [Download PDF] error: $e\n$st');
-
       if (mounted) {
         setState(() {
           _exportError = 'PDF could not be saved/shared: $e';
@@ -1215,43 +1918,50 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                                 color: AppConstants.accentRed, fontSize: 12)),
                       ),
                     ),
+
+                  // FIX: ครอบด้วย Center + ConstrainedBox เพื่อจำกัดความกว้างสูงสุดของบอร์ดเซ็นบน Web/Tablet ไม่ให้ยืดกว้างเกินสัดส่วนจริงจนลายเซ็นเบี้ยว
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Container(
-                      height: 220,
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        border: Border.all(
-                          color: _isEmpty
-                              ? AppConstants.divider
-                              : AppConstants.accentBlue,
-                          width: _isEmpty ? 1.5 : 2,
-                        ),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      clipBehavior: Clip.hardEdge,
-                      child: Stack(
-                        children: [
-                          Signature(
-                            controller: _controller,
-                            backgroundColor: Colors.white,
-                          ),
-                          Positioned(
-                            bottom: 36,
-                            left: 24,
-                            right: 24,
-                            child: Container(
-                                height: 1, color: AppConstants.divider),
-                          ),
-                          if (_isEmpty)
-                            const Center(
-                              child: Text('Sign here',
-                                  style: TextStyle(
-                                      color: AppConstants.divider,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w300)),
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 500),
+                        child: Container(
+                          height: 220,
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            border: Border.all(
+                              color: _isEmpty
+                                  ? AppConstants.divider
+                                  : AppConstants.accentBlue,
+                              width: _isEmpty ? 1.5 : 2,
                             ),
-                        ],
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          clipBehavior: Clip.hardEdge,
+                          child: Stack(
+                            children: [
+                              Signature(
+                                controller: _controller,
+                                backgroundColor: Colors.white,
+                              ),
+                              Positioned(
+                                bottom: 36,
+                                left: 24,
+                                right: 24,
+                                child: Container(
+                                    height: 1, color: AppConstants.divider),
+                              ),
+                              if (_isEmpty)
+                                const Center(
+                                  child: Text('Sign here',
+                                      style: TextStyle(
+                                          color: AppConstants.divider,
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w300)),
+                                ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ),
