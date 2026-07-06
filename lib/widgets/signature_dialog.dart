@@ -499,8 +499,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final streamedResponse = await request.send();
     final respStr = await streamedResponse.stream.bytesToString();
 
-    debugPrint(
-        '=== [Upload] HTTP ${streamedResponse.statusCode}: $respStr');
+    debugPrint('=== [Upload] HTTP ${streamedResponse.statusCode}: $respStr');
 
     // 1) ตรวจ HTTP status code ก่อน
     if (streamedResponse.statusCode != 200) {
@@ -563,8 +562,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final baseUrl = dotenv.env['SNIPEIT_BASE_URL'];
     final token = dotenv.env['SNIPEIT_API_TOKEN'];
     if (baseUrl == null || baseUrl.isEmpty || token == null || token.isEmpty) {
-      debugPrint(
-          '=== [CheckoutSignature Upload] skipped: missing .env config');
+      debugPrint('=== [CheckoutSignature Upload] skipped: missing .env config');
       return;
     }
 
@@ -687,8 +685,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
               debugPrint('=== [DeleteCheckoutArtifacts] file $fileId '
                   'rejected by server: ${body['messages']}');
             } else {
-              debugPrint(
-                  '=== [DeleteCheckoutArtifacts] file $fileId deleted '
+              debugPrint('=== [DeleteCheckoutArtifacts] file $fileId deleted '
                   '(variant ${i + 1})');
             }
           } catch (_) {
@@ -894,8 +891,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final baseUrl = dotenv.env['SNIPEIT_BASE_URL'];
     final token = dotenv.env['SNIPEIT_API_TOKEN'];
     if (baseUrl == null || baseUrl.isEmpty || token == null || token.isEmpty) {
-      debugPrint(
-          '=== [DeleteCheckoutArtifacts] skipped: missing .env config');
+      debugPrint('=== [DeleteCheckoutArtifacts] skipped: missing .env config');
       return;
     }
 
@@ -1131,7 +1127,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final warrantyProvider = getField('Warranty Provider');
     final poNumber = getField('PO Number');
     final objectId = getField('Object ID');
-    final ipAddress = getField('IP Address');
+    // final ipAddress = getField('IP Address');
     final isCheckOut = widget.isCheckOut;
 
     const grey555 = PdfColor.fromInt(0xFF555555);
@@ -1165,6 +1161,8 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       String? value2,
       double minW1 = 80,
       double minW2 = 68,
+      bool underline1 = true,
+      bool underline2 = true,
     }) {
       final children = <pw.Widget>[
         pw.SizedBox(
@@ -1173,11 +1171,13 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         ),
         pw.Expanded(
           child: pw.Container(
-            decoration: const pw.BoxDecoration(
-              border: pw.Border(
-                bottom: pw.BorderSide(color: PdfColors.grey, width: 0.5),
-              ),
-            ),
+            decoration: underline1
+                ? const pw.BoxDecoration(
+                    border: pw.Border(
+                      bottom: pw.BorderSide(color: PdfColors.grey, width: 0.5),
+                    ),
+                  )
+                : null,
             padding: const pw.EdgeInsets.only(bottom: 1),
             child: pw.Text(value1, style: ts()),
           ),
@@ -1192,11 +1192,14 @@ class _SignatureDialogState extends State<_SignatureDialog> {
           ),
           pw.Expanded(
             child: pw.Container(
-              decoration: const pw.BoxDecoration(
-                border: pw.Border(
-                  bottom: pw.BorderSide(color: PdfColors.grey, width: 0.5),
-                ),
-              ),
+              decoration: underline2
+                  ? const pw.BoxDecoration(
+                      border: pw.Border(
+                        bottom:
+                            pw.BorderSide(color: PdfColors.grey, width: 0.5),
+                      ),
+                    )
+                  : null,
               padding: const pw.EdgeInsets.only(bottom: 1),
               child: pw.Text(value2, style: ts()),
             ),
@@ -1204,7 +1207,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
         ]);
       }
       return pw.Padding(
-        padding: const pw.EdgeInsets.only(bottom: 6),
+        padding: const pw.EdgeInsets.only(bottom: 9),
         child: pw.Row(
           crossAxisAlignment: pw.CrossAxisAlignment.end,
           children: children,
@@ -1215,14 +1218,10 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final doc = pw.Document();
 
     pw.Widget buildHeader() {
-      return pw.Row(
-        crossAxisAlignment: pw.CrossAxisAlignment.center,
+      return pw.Stack(
         children: [
-          if (logoBytes != null)
-            pw.Image(pw.MemoryImage(logoBytes), height: 40)
-          else
-            pw.SizedBox(width: 60),
-          pw.Expanded(
+          // ชื่อบริษัท/ชื่อฟอร์ม — กึ่งกลางเป๊ะของความกว้างทั้งหมด ไม่ขึ้นกับฝั่งซ้าย-ขวา
+          pw.Center(
             child: pw.Column(
               children: [
                 pw.Text(AppConstants.companyName,
@@ -1235,16 +1234,32 @@ class _SignatureDialogState extends State<_SignatureDialog> {
               ],
             ),
           ),
-          pw.Text(AppConstants.formRevisionLabel,
-              style: ts(size: 8, color: grey555)),
+          // โลโก้ — ชิดซ้ายบนสุด
+          if (logoBytes != null)
+            pw.Positioned(
+              left: 0,
+              top: 0,
+              child: pw.Image(pw.MemoryImage(logoBytes), height: 40),
+            ),
+          // Revision label — ชิดขวาบนสุด
+          pw.Positioned(
+            right: 0,
+            top: 0,
+            child: pw.Text(AppConstants.formRevisionLabel,
+                style: ts(size: 8, color: grey555)),
+          ),
         ],
       );
     }
 
+    const accentNavyText = PdfColor.fromInt(0xFF1A3A6B);
+
     pw.Widget buildDeviceTypeAndAssetNumber() {
       return pw.Column(
         children: [
+          // กล่องที่ 1: checkbox ประเภทอุปกรณ์
           pw.Container(
+            width: double.infinity,
             padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
             decoration: pw.BoxDecoration(
               color: greyF0,
@@ -1268,20 +1283,28 @@ class _SignatureDialogState extends State<_SignatureDialog> {
               ],
             ),
           ),
+          pw.SizedBox(height: 8),
+          // กล่องที่ 2: Asset Number (แยกออกมาต่างหาก มีขอบครบ 4 ด้าน)
           pw.Container(
-            padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-            decoration: const pw.BoxDecoration(
-              border: pw.Border(
-                left: pw.BorderSide(width: 1.5),
-                right: pw.BorderSide(width: 1.5),
-                bottom: pw.BorderSide(width: 1.5),
-              ),
+            width: double.infinity,
+            padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: pw.BoxDecoration(
+              border: pw.Border.all(width: 1.5),
             ),
             child: pw.Row(
               children: [
-                pw.Text('Asset Number :', style: ts(font: boldFont)),
-                pw.SizedBox(width: 10),
-                pw.Text(tag, style: ts(size: 12, font: boldFont)),
+                pw.Text('Asset Number:  ',
+                    style: pw.TextStyle(
+                      font: pw.Font.helveticaBoldOblique(),
+                      fontSize: 12,
+                      color: accentNavyText,
+                    )),
+                pw.Text(tag,
+                    style: pw.TextStyle(
+                      font: pw.Font.helveticaBoldOblique(),
+                      fontSize: 14,
+                      color: accentNavyText,
+                    )),
               ],
             ),
           ),
@@ -1311,65 +1334,23 @@ class _SignatureDialogState extends State<_SignatureDialog> {
               child: pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.stretch,
                 children: [
-                  fieldRow('Name :', manufacturer,
+                  fieldRow('Brand Name :', manufacturer,
                       label2: 'Model :', value2: model),
-                  fieldRow('S/N :', serial, label2: 'RAM :', value2: ram),
+                  fieldRow('S/N :', serial),
                   fieldRow('Harddisk :', '$storageType $capacity'.trim(),
+                      label2: 'RAM :', value2: ram),
+                  fieldRow('Monitor :', monitor),
+                  fieldRow('S/N :', monitorSerial,
                       label2: 'Type :', value2: monitorType),
-                  fieldRow('Monitor :', monitor,
-                      label2: 'S/N :', value2: monitorSerial),
-                  fieldRow('Warranty (เครื่อง) :', warrantyPeriod,
-                      label2: 'Object ID :', value2: objectId),
-                  fieldRow('Warranty (บริษัทประกัน) :', warrantyProvider,
-                      label2: 'IP Address :', value2: ipAddress),
-                  fieldRow('PO Number :', poNumber, minW1: 80),
-                  pw.Padding(
-                    padding: const pw.EdgeInsets.only(bottom: 0),
-                    child: pw.Row(
-                      crossAxisAlignment: pw.CrossAxisAlignment.end,
-                      children: [
-                        pw.SizedBox(
-                          width: 80,
-                          child: pw.Text('Action :', style: ts(font: boldFont)),
-                        ),
-                        pw.Expanded(
-                          child: pw.Container(
-                            decoration: const pw.BoxDecoration(
-                              border: pw.Border(
-                                bottom: pw.BorderSide(
-                                    color: PdfColors.grey, width: 0.5),
-                              ),
-                            ),
-                            padding: const pw.EdgeInsets.only(bottom: 1),
-                            child: pw.Text(
-                              action,
-                              style: ts(
-                                font: boldFont,
-                                color: isCheckOut ? actionBlue : actionGreen,
-                              ),
-                            ),
-                          ),
-                        ),
-                        pw.SizedBox(width: 8),
-                        pw.SizedBox(
-                          width: 40,
-                          child: pw.Text('Date :', style: ts(font: boldFont)),
-                        ),
-                        pw.Expanded(
-                          child: pw.Container(
-                            decoration: const pw.BoxDecoration(
-                              border: pw.Border(
-                                bottom: pw.BorderSide(
-                                    color: PdfColors.grey, width: 0.5),
-                              ),
-                            ),
-                            padding: const pw.EdgeInsets.only(bottom: 1),
-                            child: pw.Text(dateStr, style: ts()),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  pw.SizedBox(height: 6),
+                  fieldRow('Warranty :', warrantyPeriod, underline1: false),
+                  fieldRow('Warranty :', warrantyProvider,
+                      label2: 'Object ID :',
+                      value2: objectId,
+                      underline1: false,
+                      underline2: false),
+                  fieldRow('PO Number :', poNumber,
+                      minW1: 80, underline1: false),
                 ],
               ),
             ),
@@ -1381,12 +1362,8 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     pw.Widget buildRemarkSection() {
       return pw.Container(
         padding: const pw.EdgeInsets.all(10),
-        decoration: const pw.BoxDecoration(
-          border: pw.Border(
-            left: pw.BorderSide(width: 1.5),
-            right: pw.BorderSide(width: 1.5),
-            bottom: pw.BorderSide(width: 1.5),
-          ),
+        decoration: pw.BoxDecoration(
+          border: pw.Border.all(width: 1.5),
         ),
         child: pw.Column(
           crossAxisAlignment: pw.CrossAxisAlignment.start,
@@ -1403,17 +1380,17 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                 ],
               ),
             ),
-            pw.SizedBox(height: 4),
+            pw.SizedBox(height: 6),
             pw.RichText(
               text: pw.TextSpan(
                 children: [
                   pw.TextSpan(
                       text:
                           '\u0e2b\u0e21\u0e32\u0e22\u0e40\u0e2b\u0e15\u0e38: ',
-                      style: ts(size: 9, font: boldFont)),
+                      style: ts(size: 9, font: boldFont, lineSpacing: 4)),
                   pw.TextSpan(
                     text: AppConstants.checkoutRemarkTh,
-                    style: ts(size: 9),
+                    style: ts(size: 9, lineSpacing: 4),
                   ),
                 ],
               ),
@@ -1626,7 +1603,9 @@ class _SignatureDialogState extends State<_SignatureDialog> {
               buildHeader(),
               pw.SizedBox(height: 8),
               buildDeviceTypeAndAssetNumber(),
+              pw.SizedBox(height: 8),
               buildHardwareSection(),
+              pw.SizedBox(height: 8),
               buildRemarkSection(),
               pw.SizedBox(height: 14),
               buildSignatureSection(),
@@ -1661,25 +1640,6 @@ class _SignatureDialogState extends State<_SignatureDialog> {
             color:
                 checked ? const PdfColor.fromInt(0xFF333333) : PdfColors.white,
           ),
-          child: checked
-              ? pw.Center(
-                  child: pw.Transform.rotate(
-                    angle: -0.7854,
-                    child: pw.Container(
-                      width: 5,
-                      height: 8,
-                      decoration: const pw.BoxDecoration(
-                        border: pw.Border(
-                          bottom:
-                              pw.BorderSide(color: PdfColors.white, width: 1.3),
-                          right:
-                              pw.BorderSide(color: PdfColors.white, width: 1.3),
-                        ),
-                      ),
-                    ),
-                  ),
-                )
-              : null,
         ),
         pw.SizedBox(width: 5),
         pw.Text(label, style: pw.TextStyle(font: boldFont, fontSize: 10)),
@@ -1882,8 +1842,8 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                             ),
                             SizedBox(height: 6),
                             Text(
-                              'หมายเหตุ: พนักงานยอมรับทราบว่าฮาร์ดแวร์ที่ได้รับเป็นกรรมสิทธิ์ของบริษัท พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา'
-                              'โดยฮาร์ดแวร์ที่ได้รับนี้พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น',
+                              'หมายเหตุ: พนักงานยอมรับทราบว่าฮาร์ดแวร์ที่ได้รับเป็นกรรมสิทธิ์ของบริษัท พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์'
+                              'ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา โดยฮาร์ดแวร์ที่ได้รับนี้พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น',
                               style: TextStyle(
                                   fontSize: 11,
                                   color: AppConstants.textPrimary,
@@ -2005,19 +1965,26 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                     side: const BorderSide(color: AppConstants.divider),
                   ),
                 ),
-                const Spacer(),
-                ElevatedButton.icon(
-                  onPressed: (!_isEmpty && !_isExporting) ? _confirm : null,
-                  icon: _isExporting
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2, color: Colors.white))
-                      : const Icon(Icons.picture_as_pdf_outlined, size: 18),
-                  label: Text(_isExporting
-                      ? 'Generating\u2026'
-                      : 'Confirm & Download PDF'),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: (!_isEmpty && !_isExporting) ? _confirm : null,
+                    icon: _isExporting
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2, color: Colors.white))
+                        : const Icon(Icons.picture_as_pdf_outlined, size: 18),
+                    label: Text(
+                      _isExporting ? 'Generating\u2026' : 'Confirm & Save',
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                    ),
+                  ),
                 ),
               ],
             ),

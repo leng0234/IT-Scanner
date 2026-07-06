@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:intl/intl.dart';
+
 import 'package:dio/dio.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
@@ -113,39 +115,40 @@ class SnipeITService {
 
   // ── Check-Out ──────────────────────────────────────────────────────────────
 
-  Future<void> checkOutAsset({
-    required int assetId,
-    required int userId,
-    String? checkoutAt,
-    String? note,
-  }) async {
-    final body = {
-      'checkout_to_type': 'user',
-      'assigned_user': userId,
-      'checkout_at':
-          checkoutAt ?? DateTime.now().toIso8601String().split('T').first,
-      if (note != null) 'note': note,
-    };
-    final response =
-        await _dio.post('hardware/$assetId/checkout', data: body);
-    _assertSuccess(response.data as Map<String, dynamic>);
-  }
+Future<void> checkOutAsset({
+  required int assetId,
+  required int userId,
+  String? checkoutAt,
+  String? note,
+}) async {
+  final body = {
+    'checkout_to_type': 'user',
+    'assigned_user': userId,
+    'checkout_at': checkoutAt ??
+        DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now()),
+    if (note != null) 'note': note,
+  };
+  final response =
+      await _dio.post('hardware/$assetId/checkout', data: body);
+  _assertSuccess(response.data as Map<String, dynamic>);
+}
 
-  Future<void> checkOutAssetByName({
-    required int assetId,
-    required String assigneeName,
-    String? note,
-  }) async {
-    final body = {
-      'checkout_to_type': 'user',
-      'assigned_user': 1,
-      'checkout_at': DateTime.now().toIso8601String().split('T').first,
-      'note': note ?? 'Checked out to: $assigneeName',
-    };
-    final response =
-        await _dio.post('hardware/$assetId/checkout', data: body);
-    _assertSuccess(response.data as Map<String, dynamic>);
-  }
+Future<void> checkOutAssetByName({
+  required int assetId,
+  required String assigneeName,
+  String? note,
+}) async {
+  final body = {
+    'checkout_to_type': 'user',
+    'assigned_user': 1,
+    'checkout_at': DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now()),
+    'note': note ?? 'Checked out to: $assigneeName',
+  };
+  final response =
+      await _dio.post('hardware/$assetId/checkout', data: body);
+  _assertSuccess(response.data as Map<String, dynamic>);
+}
+
 
   // ── Check-In ───────────────────────────────────────────────────────────────
 

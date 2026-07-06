@@ -461,11 +461,11 @@ class _DetailsTab extends StatelessWidget {
                         .trim(),
               ),
               const CardDivider(),
-              InfoRow(label: 'Type', value: _cf(asset, 'Type')),
-              const CardDivider(),
               InfoRow(label: 'Monitor', value: _cf(asset, 'Monitor')),
               const CardDivider(),
-              InfoRow(label: 'Monitor S/N', value: _cf(asset, 'S/N Monitor')),
+              InfoRow(label: 'Monitor S/N', value: _cf(asset, 'Monitor S/N')),
+              const CardDivider(),
+              InfoRow(label: 'Type', value: _cf(asset, 'Type')),
             ],
           ),
         ),
@@ -505,26 +505,22 @@ class _DetailsTab extends StatelessWidget {
           ),
         ),
 
-        const SectionHeader(title: 'Dates & Warranty'),
+        const SectionHeader(title: 'Warranty'),
         Card(
           child: Column(
             children: [
-              InfoRow(label: 'Purchase Date', value: asset.purchaseDate),
-              const CardDivider(),
-              InfoRow(
-                label: 'Warranty Expires',
-                valueWidget: asset.warrantyExpires != null
-                    ? _WarrantyLabel(expiresText: asset.warrantyExpires!)
-                    : null,
-                value: asset.warrantyExpires == null ? '—' : null,
-              ),
-              const CardDivider(),
               InfoRow(
                   label: 'Warranty Period', value: _cf(asset, 'Warranty Period')),
               const CardDivider(),
               InfoRow(
                   label: 'Warranty Provider',
                   value: _cf(asset, 'Warranty Provider')),
+              const CardDivider(),
+              InfoRow(
+                  label: 'Object ID', value: _cf(asset, 'Object ID')),
+              const CardDivider(),
+              InfoRow(
+                  label: 'PO number', value: _cf(asset, 'PO Number')),
               const CardDivider(),
               InfoRow(label: 'Last Updated', value: asset.updatedAt),
             ],

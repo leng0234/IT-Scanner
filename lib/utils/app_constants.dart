@@ -39,13 +39,21 @@ class AppConstants {
       'the Hardware and a standard no lower than that which a person, in general, '
       'would be expected to maintain. The hardware is possessed by the employee for work only.';
 
-  static const String checkoutRemarkTh =
-      '\u0e1e\u0e19\u0e31\u0e01\u0e07\u0e32\u0e19\u0e22\u0e2d\u0e21\u0e23\u0e31\u0e1a\u0e17\u0e23\u0e32\u0e1a\u0e27\u0e48\u0e32\u0e2e\u0e32\u0e23\u0e4c\u0e14\u0e41\u0e27\u0e23\u0e4c\u0e17\u0e35\u0e48\u0e44\u0e14\u0e49\u0e23\u0e31\u0e1a\u0e40\u0e1b\u0e47\u0e19\u0e01\u0e23\u0e23\u0e21\u0e2a\u0e34\u0e17\u0e18\u0e34\u0e4c\u0e02\u0e2d\u0e07\u0e1a\u0e23\u0e34\u0e29\u0e31\u0e17 '
-      '\u0e1e\u0e19\u0e31\u0e01\u0e07\u0e32\u0e19\u0e15\u0e01\u0e25\u0e07\u0e17\u0e35\u0e48\u0e08\u0e30\u0e14\u0e39\u0e41\u0e25\u0e41\u0e25\u0e30\u0e23\u0e31\u0e01\u0e29\u0e32\u0e2e\u0e32\u0e23\u0e4c\u0e14\u0e41\u0e27\u0e23\u0e4c\u0e43\u0e2b\u0e49\u0e21\u0e35\u0e21\u0e32\u0e15\u0e23\u0e10\u0e32\u0e19\u0e44\u0e21\u0e48\u0e15\u0e48\u0e33\u0e01\u0e27\u0e48\u0e32\u0e17\u0e35\u0e48\u0e1a\u0e38\u0e04\u0e04\u0e25\u0e17\u0e31\u0e48\u0e27\u0e44\u0e1b\u0e04\u0e27\u0e23\u0e08\u0e30\u0e23\u0e31\u0e01\u0e29\u0e32 '
-      '\u0e42\u0e14\u0e22\u0e2e\u0e32\u0e23\u0e4c\u0e14\u0e41\u0e27\u0e23\u0e4c\u0e17\u0e35\u0e48\u0e44\u0e14\u0e49\u0e23\u0e31\u0e1a\u0e19\u0e35\u0e49\u0e1e\u0e19\u0e31\u0e01\u0e07\u0e32\u0e19\u0e23\u0e31\u0e1a\u0e17\u0e23\u0e32\u0e1a\u0e27\u0e48\u0e32\u0e21\u0e35\u0e44\u0e27\u0e49\u0e2a\u0e33\u0e2b\u0e23\u0e31\u0e1a\u0e43\u0e0a\u0e49\u0e43\u0e19\u0e01\u0e32\u0e23\u0e17\u0e33\u0e07\u0e32\u0e19\u0e40\u0e17\u0e48\u0e32\u0e19\u0e31\u0e49\u0e19';
+  static const String checkoutRemarkTh = 
+      'พนักงานยอมรับทราบว่า '
+      'ฮาร์ดแวร์ที่ได้รับ '
+      'เป็นกรรมสิทธิ์ของบริษัท '
+      'พนักงานตกลงที่จะดูแลและรักษาฮาร์ดแวร์ '
+      'ให้มีมาตรฐานไม่ต่ำกว่าที่บุคคลทั่วไปควรจะรักษา '
+      'โดยฮาร์ดแวร์ที่ได้รับนี้ '
+      'พนักงานรับทราบว่ามีไว้สำหรับใช้ในการทำงานเท่านั้น';
 
   /// Device-type checkbox labels shown on the PDF, in display order.
-  static const List<String> assetDeviceTypeOptions = ['NoteBook', 'PC', 'Server'];
+  static const List<String> assetDeviceTypeOptions = [
+    'NoteBook',
+    'PC',
+    'Server'
+  ];
 
   /// Resolves which of [assetDeviceTypeOptions] should be checked based on
   /// the asset's Snipe-IT category name, falling back to the model name if
@@ -54,8 +62,7 @@ class AppConstants {
   /// change for assets without a recognizable category.
   static String resolveAssetDeviceType(String? categoryName,
       [String? modelName]) {
-    final normalized =
-        '${categoryName ?? ''} ${modelName ?? ''}'.toLowerCase();
+    final normalized = '${categoryName ?? ''} ${modelName ?? ''}'.toLowerCase();
     if (normalized.contains('server')) return 'Server';
     if (normalized.contains('desktop') || normalized.contains('pc')) {
       return 'PC';
@@ -115,10 +122,9 @@ class AppConstants {
             backgroundColor: accentBlue,
             foregroundColor: Colors.white,
             elevation: 0,
-            padding:
-                const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10)),
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
             textStyle: const TextStyle(
               fontFamily: fontFamily,
               fontSize: 15,
@@ -130,10 +136,9 @@ class AppConstants {
           style: OutlinedButton.styleFrom(
             foregroundColor: accentBlue,
             side: const BorderSide(color: accentBlue),
-            padding:
-                const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10)),
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
             textStyle: const TextStyle(
               fontFamily: fontFamily,
               fontSize: 15,
@@ -170,8 +175,7 @@ class AppConstants {
           space: 1,
         ),
         chipTheme: ChipThemeData(
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(6)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
           side: BorderSide.none,
         ),
       );
