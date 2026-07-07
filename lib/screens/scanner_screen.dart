@@ -179,6 +179,9 @@ class _ScannerScreenState extends State<ScannerScreen>
     }
   }
 
+  // NOTE: torch toggle and camera switch are currently unused because the
+  // corresponding AppBar buttons are commented out below. Left in place
+  // (unused) in case the buttons are re-enabled later.
   Future<void> _safeToggleTorch() async {
     if (_controller == null || !_scannerActive) return;
     try {
@@ -340,22 +343,26 @@ class _ScannerScreenState extends State<ScannerScreen>
       appBar: AppBar(
         title: const Text('IT Asset Scanner'),
         actions: [
-          IconButton(
-            icon: Icon(
-              Icons.flash_on,
-              color: _torchOn ? AppConstants.accentAmber : Colors.white70,
-            ),
-            // Gate on _scannerActive (not _cameraStarted) so this is
-            // disabled while the session is stopped for a lookup or
-            // for the manual-entry dialog.
-            onPressed: _scannerActive ? _safeToggleTorch : null,
-            tooltip: 'Toggle torch',
-          ),
-          IconButton(
-            icon: const Icon(Icons.cameraswitch_outlined),
-            onPressed: _scannerActive ? _safeSwitchCamera : null,
-            tooltip: 'Flip camera',
-          ),
+          // Flash torch toggle — disabled for now, keep only restart camera
+          // IconButton(
+          //   icon: Icon(
+          //     Icons.flash_on,
+          //     color: _torchOn ? AppConstants.accentAmber : Colors.white70,
+          //   ),
+          //   // Gate on _scannerActive (not _cameraStarted) so this is
+          //   // disabled while the session is stopped for a lookup or
+          //   // for the manual-entry dialog.
+          //   onPressed: _scannerActive ? _safeToggleTorch : null,
+          //   tooltip: 'Toggle torch',
+          // ),
+
+          // Flip camera — disabled for now, keep only restart camera
+          // IconButton(
+          //   icon: const Icon(Icons.cameraswitch_outlined),
+          //   onPressed: _scannerActive ? _safeSwitchCamera : null,
+          //   tooltip: 'Flip camera',
+          // ),
+
           IconButton(
             icon: const Icon(Icons.refresh, color: Colors.white70),
             onPressed: _restarting ? null : _restartCamera,

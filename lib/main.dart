@@ -19,7 +19,7 @@ class SnipeITApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'IT Asset Manager',
+      title: 'IT Asset Scanner',
       debugShowCheckedModeBanner: false,
       theme: AppConstants.theme,
       home: const ScannerScreen(),
