@@ -7,12 +7,27 @@ import 'package:http/http.dart' as http;
 
 import '../../models/asset_model.dart';
 import 'html_entity_utils.dart';
-import 'prior_checkout_record.dart';
+import 'signature_history_entry.dart';
 
 /// All HTTP calls against Snipe-IT's `/hardware/{id}/files` endpoints:
-/// uploading the signed PDF, stashing the checkout signature so it can be
-/// recovered on checkin, looking that record back up, and cleaning up the
-/// old checkout artifacts once an asset is checked back in.
+/// uploading the signed PDF, and rebuilding the checkout/checkin history
+/// for an asset.
+///
+/// No per-signature PNG files are stored. Instead, the checkout/checkin
+/// history — including every signature image, base64-encoded — is
+/// embedded as JSON in the `notes` field of a PDF file. Because Snipe-IT's
+/// `notes` field has a practical size limit, history is capped to a fixed
+/// number of cycles per PDF (see `maxHistoryCycles` in the dialog widget):
+/// once that cap is hit, the current PDF (with its full history) is left
+/// untouched forever as an archive, and a brand new PDF starts a fresh
+/// history containing only the newest signing event. Over time this
+/// produces a series of archived PDFs on the asset, each capturing one
+/// chunk of its history, instead of one ever-growing file.
+///
+/// [fetchSignatureHistory] always reads from the single *newest* PDF that
+/// carries our JSON marker — that's the currently "active" one still being
+/// added to. Older, capped-off PDFs are never read from or written to
+/// again; they just sit on the asset as a permanent record.
 ///
 /// Pulled out of the dialog widget so the network/parsing logic can be
 /// read, tested, and debugged independently of the UI.
@@ -35,7 +50,7 @@ class SnipeItFileApi {
         'Authorization': 'Bearer $token',
       };
 
-  // ── Upload the signed PDF ────────────────────────────────────────────────
+  // ── Upload the signed PDF (+ its embedded history JSON) ──────────────────
   //
   // Snipe-IT's /hardware/{id}/files endpoint can return HTTP 200 while the
   // JSON body itself says `"status": "error"` (e.g. wrong field name,
@@ -43,11 +58,21 @@ class SnipeItFileApi {
   // would treat those in-body errors as success, so the JSON body's
   // `status` field is checked too. The multipart field name is `file[]`
   // (array form), which is what Snipe-IT's file upload endpoint expects.
-  Future<void> uploadPdf({
+  //
+  // [historyEntries] must be exactly what this PDF's printed table shows —
+  // whatever this PDF's `notes` says becomes the sole source of truth the
+  // next time [fetchSignatureHistory] reads from it.
+  //
+  // Returns the id Snipe-IT assigned to the newly-created file (and the
+  // filename used) so the caller can later target this exact file — e.g.
+  // to strip its note once its cycle-group is fully closed off, without
+  // needing a fresh files-list lookup.
+  Future<({int? fileId, String fileName})> uploadPdf({
     required Uint8List pdfBytes,
     required String action,
     required AssetModel asset,
     required String? assigneeName,
+    required List<SignatureHistoryEntry> historyEntries,
   }) async {
     final assetId = asset.id;
     if (assetId == null) {
@@ -62,19 +87,21 @@ class SnipeItFileApi {
 
     final uri = Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files');
 
-    final now = DateTime.now();
-    final dateString =
-        '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
     final fileName =
-        '${asset.assetTag ?? 'Asset'}_${assigneeName ?? 'User'}_${dateString}_$action.pdf';
+        '${asset.assetTag ?? 'Asset'}_IT Asset Request and Return Form.pdf';
+
+    final notesJson = jsonEncode({
+      'pdfHistory': true,
+      'summary': '$action document signed by ${assigneeName ?? 'Unknown'}',
+      'history': [for (final e in historyEntries) e.toJson()],
+    });
 
     final request = http.MultipartRequest('POST', uri);
     request.headers.addAll(_headers(creds.token));
     request.files.add(
       http.MultipartFile.fromBytes('file[]', pdfBytes, filename: fileName),
     );
-    request.fields['notes'] =
-        '$action document signed by ${assigneeName ?? 'Unknown'}';
+    request.fields['notes'] = notesJson;
 
     final streamedResponse = await request.send();
     final respStr = await streamedResponse.stream.bytesToString();
@@ -100,182 +127,51 @@ class SnipeItFileApi {
     }
 
     debugPrint('=== [Upload] Success: PDF uploaded for Asset ID $assetId');
-  }
 
-  // ── Save checkout signature separately (for later reuse on checkin) ──────
-  //
-  // When checking a device OUT, we additionally upload just the signature
-  // PNG (not the whole PDF) as its own small file attached to the asset,
-  // tagged with a recognizable filename marker
-  // (`_checkout_signature_<assetId>.png`) and with the recipient's
-  // name/division/date packed as JSON into that file's `notes` field.
-  //
-  // Later, when the SAME asset is checked back IN, [fetchPriorCheckoutRecord]
-  // looks this file up and downloads it, so the "Receive" box on the checkin
-  // PDF is filled in automatically instead of printing a blank placeholder
-  // — no local storage needed, Snipe-IT itself is the storage.
-  //
-  // Deliberately best-effort: if it fails, we only log it and move on,
-  // since a failure here must never block the checkout flow the user is
-  // actually waiting on. Callers should still `await` this (rather than
-  // fire-and-forget) so a checkin started moments later doesn't race an
-  // in-flight upload and see it as "missing".
-  Future<void> uploadCheckoutSignature({
-    required Uint8List sigBytes,
-    required AssetModel asset,
-    required String dateStr,
-    required String? assigneeName,
-    String? division,
-  }) async {
-    final assetId = asset.id;
-    if (assetId == null) return;
-
-    final creds = _credentials();
-    if (creds == null) {
-      debugPrint('=== [CheckoutSignature Upload] skipped: missing .env config');
-      return;
-    }
-
+    // Best-effort extraction of the new file's id from
+    // payload.rows[0].id — if the response shape doesn't match (e.g. a
+    // Snipe-IT version difference), just return null and let the caller's
+    // fallback (clearArchivedFileNote via a fresh files-list lookup) cover
+    // it instead.
+    int? newFileId;
     try {
-      final uri = Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files');
-      final fileName = '_checkout_signature_$assetId.png';
-
-      final metaNotes = jsonEncode({
-        'assigneeName': assigneeName ?? '—',
-        'division': division,
-        'dateStr': dateStr,
-      });
-
-      final request = http.MultipartRequest('POST', uri);
-      request.headers.addAll(_headers(creds.token));
-      request.files.add(
-        http.MultipartFile.fromBytes('file[]', sigBytes, filename: fileName),
-      );
-      request.fields['notes'] = metaNotes;
-
-      final streamed = await request.send();
-      final body = await streamed.stream.bytesToString();
-      debugPrint(
-          '=== [CheckoutSignature Upload] HTTP ${streamed.statusCode}: $body');
-    } catch (e, st) {
-      debugPrint('=== [CheckoutSignature Upload] error: $e\n$st');
-    }
-  }
-
-  // ── Look up the checkout signature saved above (for checkin PDFs) ────────
-  //
-  // CONFIRMED RESPONSE SHAPE (from live debug log on 2026-07-03): Snipe-IT's
-  // file-listing calls return:
-  //   { "status": "success", "payload": { "total": N, "rows": [ {
-  //       "id": 66, "filename": "...", "note": "...", ...
-  //   } ] } }
-  // Files live under `GET /hardware/{id}/files` (NOT embedded in the plain
-  // asset-detail response), and the per-file note key is `note` (singular),
-  // not `notes`. A couple of alternate shapes are still checked as a
-  // fallback in case of version differences, so this degrades to returning
-  // null (blank checkout box) instead of crashing if your instance differs.
-  //
-  // Matching is done primarily via the `note` JSON payload (which we
-  // control and Snipe-IT does not rewrite), with a looser,
-  // separator-agnostic filename check as a fallback — Snipe-IT renames
-  // every uploaded file on its own (prefixes "asset-{id}-{randomhash}-" and
-  // converts underscores to hyphens), so matching on the exact original
-  // filename substring does not work.
-  Future<PriorCheckoutRecord?> fetchPriorCheckoutRecord({
-    required int assetId,
-    required String? assigneeName,
-    String? division,
-  }) async {
-    final creds = _credentials();
-    if (creds == null) return null;
-    final headers = _headers(creds.token);
-
-    try {
-      final filesUri =
-          Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files');
-      final filesResp = await http.get(filesUri, headers: headers);
-      if (filesResp.statusCode != 200) {
-        debugPrint('=== [PriorCheckout] failed to fetch files list: '
-            'HTTP ${filesResp.statusCode}');
-        return null;
-      }
-
-      final rawFiles = _extractFileRows(filesResp.body);
-      if (rawFiles == null) {
-        debugPrint('=== [PriorCheckout] no files found in response: '
-            '${filesResp.body}');
-        return null;
-      }
-
-      final match = _findCheckoutSignatureFile(rawFiles);
-      if (match == null) {
-        debugPrint('=== [PriorCheckout] no checkout-signature file found '
-            'among ${rawFiles.length} file(s)');
-        return null;
-      }
-
-      final fileId = match['id'];
-      if (fileId == null) return null;
-
-      final fileUri = Uri.parse(
-          '${creds.baseUrl}/api/v1/hardware/$assetId/files/$fileId');
-      final fileResp = await http.get(fileUri, headers: headers);
-      if (fileResp.statusCode != 200 || fileResp.bodyBytes.isEmpty) {
-        debugPrint('=== [PriorCheckout] failed to download file $fileId: '
-            'HTTP ${fileResp.statusCode}');
-        return null;
-      }
-
-      // Recover assignee/division/date, packed as JSON into the file's
-      // note when it was uploaded. Snipe-IT returns this back as `note`
-      // (singular) even though the upload field is named `notes` — check
-      // both. `dateStr` has no fallback other than '—': it's the field
-      // that actually restores the checkout date on the checkin PDF.
-      String? recoveredName;
-      String? recoveredDivision;
-      String? recoveredDate;
-      final noteValue = (match['note'] ?? match['notes'])?.toString();
-      if (noteValue != null && noteValue.isNotEmpty) {
-        try {
-          final meta = jsonDecode(HtmlEntityUtils.decode(noteValue))
-              as Map<String, dynamic>;
-          recoveredName = meta['assigneeName']?.toString();
-          recoveredDivision = meta['division']?.toString();
-          recoveredDate = meta['dateStr']?.toString();
-        } catch (_) {
-          // note wasn't our JSON payload (e.g. edited manually) — ignore.
+      final rows = (json['payload'] as Map?)?['rows'];
+      if (rows is List && rows.isNotEmpty) {
+        final firstRow = rows.first;
+        if (firstRow is Map && firstRow['id'] is num) {
+          newFileId = (firstRow['id'] as num).toInt();
         }
       }
-
-      return PriorCheckoutRecord(
-        assigneeName: recoveredName ?? assigneeName ?? '—',
-        division: recoveredDivision ?? division,
-        dateStr: recoveredDate ?? '—',
-        sigBytes: fileResp.bodyBytes,
-      );
-    } catch (e, st) {
-      debugPrint('=== [PriorCheckout] lookup failed: $e\n$st');
-      return null;
+    } catch (_) {
+      // Ignore — caller falls back to the safety-net path.
     }
+
+    return (fileId: newFileId, fileName: fileName);
   }
 
-  // ── Clean up checkout artifacts once checked back in ──────────────────────
+  // ── Rebuild the checkout/checkin history from the active PDF ─────────────
   //
-  // After a successful CHECKIN, delete the two files that were uploaded
-  // during the matching CHECKOUT — the checkout PDF and the standalone
-  // checkout-signature PNG — so Snipe-IT ends up holding just this one
-  // checkin PDF instead of accumulating a growing pile of files every
-  // checkout/checkin cycle.
+  // Steps:
+  //   1. List every file attached to the asset.
+  //   2. Among files whose `note` decodes to our JSON marker
+  //      (`pdfHistory: true`), keep the one with the highest file id —
+  //      Snipe-IT ids are assigned in increasing order, so that's the most
+  //      recently uploaded PDF, i.e. the currently "active" one.
+  //   3. Decode its `history` array (each entry carries its signature image
+  //      as base64 already, so no extra file downloads are needed).
+  //   4. Pair entries that share the same `cycleId` into one row each
+  //      (a checkout and its matching checkin), oldest cycle first.
   //
-  // Deliberately best-effort: this only runs *after* the checkin PDF has
-  // already uploaded successfully, so a failure here must never surface as
-  // a failed checkin — it's just log-and-move-on cleanup.
-  Future<void> deleteCheckoutArtifacts(int assetId) async {
+  // Also returns [sourceFileId] — the file id the history was read from —
+  // so the caller knows exactly which file to delete if it's about to
+  // upload a replacement that continues the same history thread. Returns
+  // an empty result (rather than throwing) on any failure, so a history
+  // lookup problem degrades to "no history shown" instead of blocking PDF
+  // generation.
+  Future<({List<SignatureHistoryRow> rows, int? sourceFileId})>
+      fetchSignatureHistory({required int assetId}) async {
     final creds = _credentials();
-    if (creds == null) {
-      debugPrint('=== [DeleteCheckoutArtifacts] skipped: missing .env config');
-      return;
-    }
+    if (creds == null) return (rows: <SignatureHistoryRow>[], sourceFileId: null);
     final headers = _headers(creds.token);
 
     try {
@@ -283,136 +179,269 @@ class SnipeItFileApi {
           Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files');
       final filesResp = await http.get(filesUri, headers: headers);
       if (filesResp.statusCode != 200) {
-        debugPrint('=== [DeleteCheckoutArtifacts] failed to fetch files '
-            'list: HTTP ${filesResp.statusCode}');
-        return;
+        debugPrint('=== [SignatureHistory] failed to fetch files list: '
+            'HTTP ${filesResp.statusCode}');
+        return (rows: <SignatureHistoryRow>[], sourceFileId: null);
       }
 
       final rawFiles = _extractFileRows(filesResp.body);
       if (rawFiles == null) {
-        debugPrint(
-            '=== [DeleteCheckoutArtifacts] no files found for asset $assetId');
-        return;
+        debugPrint('=== [SignatureHistory] no files found for asset $assetId');
+        return (rows: <SignatureHistoryRow>[], sourceFileId: null);
       }
 
-      final idsToDelete = <int>[];
-
+      // Find the newest PDF whose note carries our JSON marker.
+      Map<String, dynamic>? latestMeta;
+      int latestId = -1;
       for (final f in rawFiles) {
         if (f is! Map) continue;
-
-        final noteRaw = (f['note'] ?? f['notes'])?.toString() ?? '';
-        final noteDecoded = HtmlEntityUtils.decode(noteRaw);
-        final name = (f['filename'] ?? f['file_name'] ?? f['name'] ?? '')
-            .toString()
-            .toLowerCase();
-
-        // Checkout signature PNG: our JSON note marker.
-        var isCheckoutSignature = false;
-        try {
-          final meta = jsonDecode(noteDecoded) as Map<String, dynamic>;
-          if (meta.containsKey('assigneeName')) {
-            isCheckoutSignature = true;
-          }
-        } catch (_) {
-          // not our JSON note
-        }
-        if (!isCheckoutSignature &&
-            name.contains('checkout') &&
-            name.contains('signature')) {
-          isCheckoutSignature = true;
-        }
-
-        // Checkout PDF: plain-sentence note written by uploadPdf().
-        // Explicitly excludes "checkin" filenames so a checkin PDF whose
-        // sanitized name happens to also contain "checkout" as a substring
-        // (it shouldn't, but be defensive) is never swept up here.
-        final isCheckoutPdf = noteDecoded
-                .trim()
-                .toLowerCase()
-                .startsWith('checkout document signed by') ||
-            (name.contains('checkout') &&
-                name.endsWith('.pdf') &&
-                !name.contains('checkin'));
-
-        if (isCheckoutSignature || isCheckoutPdf) {
-          final fId = f['id'];
-          if (fId is num) idsToDelete.add(fId.toInt());
-        }
-      }
-
-      if (idsToDelete.isEmpty) {
-        debugPrint('=== [DeleteCheckoutArtifacts] nothing to delete for '
-            'asset $assetId');
-        return;
-      }
-
-      for (final fileId in idsToDelete) {
-        await _deleteFile(creds.baseUrl, headers, assetId, fileId);
-      }
-    } catch (e, st) {
-      debugPrint('=== [DeleteCheckoutArtifacts] error: $e\n$st');
-    }
-  }
-
-  // ── Shared helpers ─────────────────────────────────────────────────────────
-
-  /// Extracts the `rows` list from Snipe-IT's file-listing response,
-  /// trying the confirmed `payload.rows` shape first, then a couple of
-  /// fallbacks for version differences. Returns null if nothing usable.
-  List<dynamic>? _extractFileRows(String responseBody) {
-    final decoded = jsonDecode(responseBody) as Map<String, dynamic>;
-    final rawFiles = (decoded['payload'] is Map
-            ? (decoded['payload'] as Map)['rows']
-            : null) ??
-        decoded['rows'] ??
-        decoded['uploads'] ??
-        decoded['files'];
-    if (rawFiles is! List || rawFiles.isEmpty) return null;
-    return rawFiles;
-  }
-
-  /// Finds the checkout-signature marker file among [rawFiles]. If several
-  /// matches exist (from multiple past checkouts), returns the most
-  /// recently uploaded one (highest file id).
-  Map<String, dynamic>? _findCheckoutSignatureFile(List<dynamic> rawFiles) {
-    Map<String, dynamic>? match;
-    for (final f in rawFiles) {
-      if (f is! Map) continue;
-
-      bool isOurs = false;
-
-      final noteValue = (f['note'] ?? f['notes'])?.toString();
-      if (noteValue != null && noteValue.isNotEmpty) {
+        final noteValue = (f['note'] ?? f['notes'])?.toString();
+        if (noteValue == null || noteValue.isEmpty) continue;
         try {
           final meta = jsonDecode(HtmlEntityUtils.decode(noteValue))
               as Map<String, dynamic>;
-          if (meta.containsKey('assigneeName')) {
-            isOurs = true;
+          if (meta['pdfHistory'] != true) continue;
+          final fId = f['id'];
+          if (fId is num && fId.toInt() > latestId) {
+            latestId = fId.toInt();
+            latestMeta = meta;
           }
         } catch (_) {
-          // Not our JSON note (e.g. the main PDF's "X document signed by
-          // Y" sentence, or a manually edited note) — not a match.
+          // Not our JSON note — ignore (manual attachments, etc.).
         }
       }
 
-      if (!isOurs) {
-        final name = (f['filename'] ?? f['file_name'] ?? f['name'] ?? '')
-            .toString()
-            .toLowerCase();
-        if (name.contains('checkout') && name.contains('signature')) {
-          isOurs = true;
+      if (latestMeta == null) {
+        debugPrint('=== [SignatureHistory] no history-carrying PDF found '
+            'among ${rawFiles.length} file(s)');
+        return (rows: <SignatureHistoryRow>[], sourceFileId: null);
+      }
+
+      final historyList = latestMeta['history'];
+      if (historyList is! List) {
+        return (rows: <SignatureHistoryRow>[], sourceFileId: latestId);
+      }
+
+      final entries = <SignatureHistoryEntry>[];
+      for (final e in historyList) {
+        if (e is! Map) continue;
+        try {
+          entries.add(SignatureHistoryEntry.fromJson(
+              Map<String, dynamic>.from(e)));
+        } catch (_) {
+          continue;
         }
       }
 
-      if (isOurs) {
-        final fId = (f['id'] as num?) ?? 0;
-        final matchId = (match?['id'] as num?) ?? -1;
-        if (match == null || fId > matchId) {
-          match = Map<String, dynamic>.from(f);
+      // Pair checkout/checkin entries sharing the same cycleId into rows.
+      // `order` preserves first-seen order of each cycleId; since cycleIds
+      // are minted from millisecondsSinceEpoch (see signature_dialog.dart),
+      // sorting them also sorts the rows chronologically.
+      final rows = <String, SignatureHistoryRow>{};
+      final order = <String>[];
+      for (final entry in entries) {
+        final existing = rows[entry.cycleId];
+        if (existing == null) {
+          rows[entry.cycleId] = SignatureHistoryRow(
+            cycleId: entry.cycleId,
+            checkoutEntry: entry.isCheckout ? entry : null,
+            checkinEntry: entry.isCheckout ? null : entry,
+          );
+          order.add(entry.cycleId);
+        } else {
+          rows[entry.cycleId] = SignatureHistoryRow(
+            cycleId: entry.cycleId,
+            checkoutEntry: entry.isCheckout ? entry : existing.checkoutEntry,
+            checkinEntry: entry.isCheckout ? existing.checkinEntry : entry,
+          );
         }
+      }
+
+      order.sort();
+      return (
+        rows: [for (final id in order) rows[id]!],
+        sourceFileId: latestId,
+      );
+    } catch (e, st) {
+      debugPrint('=== [SignatureHistory] lookup failed: $e\n$st');
+      return (rows: <SignatureHistoryRow>[], sourceFileId: null);
+    }
+  }
+
+  /// Finds the cycleId of a checkout that hasn't been matched with a
+  /// checkin yet (i.e. the asset is currently checked out to someone).
+  /// Returns null if there's no open cycle — meaning a fresh checkout
+  /// should mint a brand new cycleId rather than reuse one.
+  Future<String?> findOpenCycleId({required int assetId}) async {
+    final history = await fetchSignatureHistory(assetId: assetId);
+    for (final row in history.rows.reversed) {
+      if (row.checkoutEntry != null && row.checkinEntry == null) {
+        return row.cycleId;
       }
     }
-    return match;
+    return null;
+  }
+
+  // ── Delete one specific PDF file ──────────────────────────────────────────
+  //
+  // Used only to remove the PDF that a new upload has just superseded
+  // (i.e. the previous "active" PDF whose history got merged into the new
+  // one). Archived, capped-off PDFs are never passed here, so they persist
+  // on the asset indefinitely.
+  //
+  // Deliberately best-effort: a failure here (network hiccup, missing
+  // delete permission, etc.) must never surface as a failed
+  // checkout/checkin — it's just log-and-move-on cleanup. Worst case, an
+  // old PDF is simply left behind for manual cleanup.
+  Future<void> deletePdfFile({required int assetId, required int fileId}) async {
+    final creds = _credentials();
+    if (creds == null) {
+      debugPrint('=== [DeletePdf] skipped: missing .env config');
+      return;
+    }
+    final headers = _headers(creds.token);
+    try {
+      await _deleteFile(creds.baseUrl, headers, assetId, fileId);
+    } catch (e, st) {
+      debugPrint('=== [DeletePdf] error: $e\n$st');
+    }
+  }
+
+  // ── Strip the note off a PDF whose cycle-group just closed out ───────────
+  //
+  // Called right after uploading a PDF that: (a) has just reached
+  // `maxHistoryCycles` cycles, and (b) every one of those cycles is a
+  // closed checkout+checkin pair (no open checkout waiting on a checkin).
+  // Once both are true, this exact file will never be written to again —
+  // the very next new cycle always starts a brand new PDF — so its note
+  // (the JSON history blob with every past signature image, base64
+  // encoded) is safe to strip immediately rather than waiting for that
+  // next PDF to appear.
+  //
+  // Unlike [clearArchivedFileNote], this doesn't need to download the PDF
+  // back from Snipe-IT first — the caller just finished building and
+  // uploading these exact [pdfBytes], so they're reused directly. That
+  // saves a network round trip, at the cost of two more Snipe-IT
+  // operations (delete + re-upload) tacked onto the same action.
+  //
+  // Deliberately best-effort, matching the other cleanup methods here: any
+  // failure is logged and swallowed rather than surfaced as a failed
+  // checkout/checkin. Worst case, this file simply keeps its full note
+  // and [clearArchivedFileNote]'s cap-exceeded fallback catches it later.
+  Future<void> finalizeClosedCycleFile({
+    required int assetId,
+    required int fileId,
+    required Uint8List pdfBytes,
+    required String fileName,
+  }) async {
+    final creds = _credentials();
+    if (creds == null) {
+      debugPrint('=== [FinalizeClosedCycle] skipped: missing .env config');
+      return;
+    }
+    final headers = _headers(creds.token);
+
+    try {
+      await _deleteFile(creds.baseUrl, headers, assetId, fileId);
+
+      final uploadUri =
+          Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files');
+      final request = http.MultipartRequest('POST', uploadUri);
+      request.headers.addAll(headers);
+      request.files.add(
+        http.MultipartFile.fromBytes('file[]', pdfBytes, filename: fileName),
+      );
+      request.fields['notes'] = '';
+
+      final streamedResponse = await request.send();
+      final respStr = await streamedResponse.stream.bytesToString();
+      debugPrint('=== [FinalizeClosedCycle] re-upload for file $fileId: '
+          'HTTP ${streamedResponse.statusCode}: $respStr');
+    } catch (e, st) {
+      debugPrint('=== [FinalizeClosedCycle] error: $e\n$st');
+    }
+  }
+
+  // ── Strip the embedded-history note off an archived (capped-off) PDF ─────
+  //
+  // Snipe-IT's file API only exposes upload (POST) and delete (DELETE) —
+  // there's no "update note" endpoint for a file that's already been
+  // uploaded. So the only way to clear a previously-uploaded file's `note`
+  // field is: download its bytes, delete it, then re-upload the exact same
+  // bytes under a fresh file id with an empty note.
+  //
+  // Called once a PDF has been capped off and archived (see
+  // `maxHistoryCycles` in the dialog widget): its JSON history note (which
+  // embeds every signature image as base64) has already been folded into
+  // the new active PDF's note, so leaving it in place would just be a
+  // redundant, ever-growing copy of old signature data sitting on the
+  // asset forever. The PDF file itself is kept — only its note is cleared.
+  //
+  // Deliberately best-effort, matching `deletePdfFile`: any failure here
+  // (download hiccup, missing permission, etc.) is logged and swallowed —
+  // it must never surface as a failed checkout/checkin. Worst case, the
+  // archived PDF simply keeps its old note.
+  Future<void> clearArchivedFileNote({
+    required int assetId,
+    required int fileId,
+  }) async {
+    final creds = _credentials();
+    if (creds == null) {
+      debugPrint('=== [ClearNote] skipped: missing .env config');
+      return;
+    }
+    final headers = _headers(creds.token);
+
+    try {
+      final downloadUri =
+          Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files/$fileId');
+      final downloadResp = await http.get(downloadUri, headers: headers);
+      if (downloadResp.statusCode != 200 || downloadResp.bodyBytes.isEmpty) {
+        debugPrint('=== [ClearNote] failed to download file $fileId: '
+            'HTTP ${downloadResp.statusCode}');
+        return;
+      }
+
+      // Recover the original filename from Content-Disposition so the
+      // re-uploaded copy still looks like the same document; fall back to
+      // a generic name if the header is missing or unparseable.
+      var fileName = 'Archived_$fileId.pdf';
+      final disposition = downloadResp.headers['content-disposition'];
+      if (disposition != null) {
+        final match = RegExp('filename\\*?=(?:UTF-8\'\')?"?([^";]+)"?')
+            .firstMatch(disposition);
+        final captured = match?.group(1);
+        if (captured != null && captured.isNotEmpty) {
+          try {
+            fileName = Uri.decodeComponent(captured);
+          } catch (_) {
+            fileName = captured;
+          }
+        }
+      }
+
+      final pdfBytes = downloadResp.bodyBytes;
+
+      // Delete the old (noted) copy first — if this fails, bail out rather
+      // than risk ending up with two copies of the archived PDF.
+      await _deleteFile(creds.baseUrl, headers, assetId, fileId);
+
+      final uploadUri =
+          Uri.parse('${creds.baseUrl}/api/v1/hardware/$assetId/files');
+      final request = http.MultipartRequest('POST', uploadUri);
+      request.headers.addAll(headers);
+      request.files.add(
+        http.MultipartFile.fromBytes('file[]', pdfBytes, filename: fileName),
+      );
+      request.fields['notes'] = '';
+
+      final streamedResponse = await request.send();
+      final respStr = await streamedResponse.stream.bytesToString();
+      debugPrint('=== [ClearNote] re-upload for old file $fileId: '
+          'HTTP ${streamedResponse.statusCode}: $respStr');
+    } catch (e, st) {
+      debugPrint('=== [ClearNote] error: $e\n$st');
+    }
   }
 
   // ── Delete a single hardware file, trying known route variants ───────────
@@ -455,7 +484,7 @@ class SnipeItFileApi {
     for (var i = 0; i < attempts.length; i++) {
       try {
         final resp = await attempts[i]();
-        debugPrint('=== [DeleteCheckoutArtifacts] file $fileId attempt '
+        debugPrint('=== [DeletePdf] file $fileId attempt '
             '${i + 1}/${attempts.length}: HTTP ${resp.statusCode} '
             '${resp.body}');
 
@@ -470,11 +499,11 @@ class SnipeItFileApi {
           try {
             final body = jsonDecode(resp.body) as Map<String, dynamic>;
             if (body['status']?.toString().toLowerCase() == 'error') {
-              debugPrint('=== [DeleteCheckoutArtifacts] file $fileId '
-                  'rejected by server: ${body['messages']}');
+              debugPrint('=== [DeletePdf] file $fileId rejected by '
+                  'server: ${body['messages']}');
             } else {
-              debugPrint('=== [DeleteCheckoutArtifacts] file $fileId deleted '
-                  '(variant ${i + 1})');
+              debugPrint(
+                  '=== [DeletePdf] file $fileId deleted (variant ${i + 1})');
             }
           } catch (_) {
             // Non-JSON 200 body — treat as success and stop trying.
@@ -482,14 +511,30 @@ class SnipeItFileApi {
         }
         return;
       } catch (e, st) {
-        debugPrint('=== [DeleteCheckoutArtifacts] file $fileId attempt '
-            '${i + 1} threw: $e\n$st');
+        debugPrint(
+            '=== [DeletePdf] file $fileId attempt ${i + 1} threw: $e\n$st');
       }
     }
 
-    debugPrint('=== [DeleteCheckoutArtifacts] file $fileId: all delete '
-        'route variants failed (405/404) — check `php artisan route:list '
-        '--path=files` on the server to find the correct route for this '
-        'install.');
+    debugPrint('=== [DeletePdf] file $fileId: all delete route variants '
+        'failed (405/404) — check `php artisan route:list --path=files` on '
+        'the server to find the correct route for this install.');
+  }
+
+  // ── Shared helpers ─────────────────────────────────────────────────────────
+
+  /// Extracts the `rows` list from Snipe-IT's file-listing response,
+  /// trying the confirmed `payload.rows` shape first, then a couple of
+  /// fallbacks for version differences. Returns null if nothing usable.
+  List<dynamic>? _extractFileRows(String responseBody) {
+    final decoded = jsonDecode(responseBody) as Map<String, dynamic>;
+    final rawFiles = (decoded['payload'] is Map
+            ? (decoded['payload'] as Map)['rows']
+            : null) ??
+        decoded['rows'] ??
+        decoded['uploads'] ??
+        decoded['files'];
+    if (rawFiles is! List || rawFiles.isEmpty) return null;
+    return rawFiles;
   }
 }

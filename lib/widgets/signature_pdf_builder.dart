@@ -6,7 +6,7 @@ import 'package:pdf/widgets.dart' as pw;
 import '../../models/asset_model.dart';
 import '../../utils/app_constants.dart';
 import 'html_entity_utils.dart';
-import 'prior_checkout_record.dart';
+import 'signature_history_entry.dart';
 
 /// Standalone typedef for avoiding inline nesting issues on some Dart
 /// analyzers.
@@ -34,13 +34,21 @@ class SignaturePdfBuilder {
     required String assigneeName,
     required String division,
     required Uint8List sigBytes,
-    required Uint8List qrPngBytes,
+    // QR code disabled for now — see buildVerificationSection() below and
+    // the generateQrPngBytes() call in signature_dialog.dart, both
+    // commented out. This stays optional/unused until re-enabled.
+    Uint8List? qrPngBytes,
     required bool isCheckOut,
     Uint8List? logoBytes,
     String verifyCode = '',
     pw.Font? sarabunRegular,
     pw.Font? sarabunBold,
-    PriorCheckoutRecord? priorCheckout,
+    // Every checkout/checkin cycle this asset has ever had, oldest first.
+    // The signature table renders one row per entry here. If this is
+    // empty (e.g. history lookup failed or the asset has no id), a single
+    // fallback row is built from the current action instead so the PDF
+    // still shows at least today's signature.
+    List<SignatureHistoryRow> historyRows = const [],
   }) async {
     String getField(String key) {
       final field = (asset.customFields ?? {})[key];
@@ -68,8 +76,7 @@ class SignaturePdfBuilder {
     const grey555 = PdfColor.fromInt(0xFF555555);
     const greyDDD = PdfColor.fromInt(0xFFDDDDDD);
     const greyF0 = PdfColor.fromInt(0xFFF0F0F0);
-    // const greyF5 = PdfColor.fromInt(0xFFF5F5F5); // used only by the
-    // (disabled) QR verification section below
+    const greyF5 = PdfColor.fromInt(0xFFF5F5F5);
     const white = PdfColors.white;
     const accentNavyText = PdfColor.fromInt(0xFF1A3A6B);
 
@@ -188,7 +195,7 @@ class SignaturePdfBuilder {
                 bottom: 0,
                 child: pw.Align(
                   alignment: pw.Alignment.centerLeft,
-                  child: pw.Image(pw.MemoryImage(logoBytes), height: 80),
+                  child: pw.Image(pw.MemoryImage(logoBytes), height: 60),
                 ),
               ),
             // Revision label — ชิดขวาบนสุด
@@ -286,54 +293,44 @@ class SignaturePdfBuilder {
         decoration: pw.BoxDecoration(
           border: pw.Border.all(width: 1.5),
         ),
-        // NOTE: small padding added here so the grey header background
-        // (below) never paints over this outer border. The border stroke
-        // is centered on the container edge, so only about half its width
-        // (~0.75 of the 1.5 border) actually sits inside the box — using
-        // the full 1.5 as padding overshoots and leaves a visible white
-        // gap between the border and the grey fill.
-        child: pw.Padding(
-          padding: const pw.EdgeInsets.all(0.75),
-          child: pw.Column(
-            children: [
-              pw.Container(
-                width: double.infinity,
-                color: grey555,
-                padding: const pw.EdgeInsets.symmetric(vertical: 5),
-                child: pw.Text(
-                  AppConstants.hardwareDetailsHeader,
-                  style: ts(size: 11, font: boldFont, color: white),
-                  textAlign: pw.TextAlign.center,
-                ),
+        child: pw.Column(
+          children: [
+            pw.Container(
+              width: double.infinity,
+              color: grey555,
+              padding: const pw.EdgeInsets.symmetric(vertical: 5),
+              child: pw.Text(
+                AppConstants.hardwareDetailsHeader,
+                style: ts(size: 11, font: boldFont, color: white),
+                textAlign: pw.TextAlign.center,
               ),
-              pw.Container(
-                padding: const pw.EdgeInsets.fromLTRB(12, 8, 12, 12),
-                child: pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-                  children: [
-                    fieldRow('Brand Name :', manufacturer,
-                        label2: 'Model :', value2: model),
-                    fieldRow('S/N :', serial),
-                    fieldRow('Harddisk :', '$storageType $capacity'.trim(),
-                        label2: 'RAM :', value2: ram),
-                    fieldRow('Monitor :', monitor),
-                    fieldRow('S/N :', monitorSerial,
-                        label2: 'Type :', value2: monitorType),
-                    pw.SizedBox(height: 6),
-                    fieldRow('Warranty :', warrantyPeriod,
-                        underline1: false),
-                    fieldRow('Warranty :', warrantyProvider,
-                        label2: 'Object ID :',
-                        value2: objectId,
-                        underline1: false,
-                        underline2: false),
-                    fieldRow('PO Number :', poNumber,
-                        minW1: 80, underline1: false),
-                  ],
-                ),
+            ),
+            pw.Container(
+              padding: const pw.EdgeInsets.fromLTRB(12, 8, 12, 12),
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+                children: [
+                  fieldRow('Brand Name :', manufacturer,
+                      label2: 'Model :', value2: model),
+                  fieldRow('S/N :', serial),
+                  fieldRow('Harddisk :', '$storageType $capacity'.trim(),
+                      label2: 'RAM :', value2: ram),
+                  fieldRow('Monitor :', monitor),
+                  fieldRow('S/N :', monitorSerial,
+                      label2: 'Type :', value2: monitorType),
+                  pw.SizedBox(height: 6),
+                  fieldRow('Warranty :', warrantyPeriod, underline1: false),
+                  fieldRow('Warranty :', warrantyProvider,
+                      label2: 'Object ID :',
+                      value2: objectId,
+                      underline1: false,
+                      underline2: false),
+                  fieldRow('PO Number :', poNumber,
+                      minW1: 80, underline1: false),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       );
     }
@@ -385,8 +382,8 @@ class SignaturePdfBuilder {
     }) {
       final hasSig = sigImageBytes != null;
       return pw.Container(
-        height: 110,
-        padding: const pw.EdgeInsets.all(8),
+        height: 62,
+        padding: const pw.EdgeInsets.all(4),
         child: pw.Column(
           mainAxisAlignment: pw.MainAxisAlignment.end,
           crossAxisAlignment: pw.CrossAxisAlignment.start,
@@ -397,22 +394,22 @@ class SignaturePdfBuilder {
                       alignment: pw.Alignment.center,
                       child: pw.Image(
                         pw.MemoryImage(sigImageBytes),
-                        height: 45,
+                        height: 26,
                         fit: pw.BoxFit.contain,
                       ),
                     )
                   : pw.Center(
                       child: pw.Text('ยังไม่มีลายเซ็น',
-                          style: ts(size: 8, color: PdfColors.grey400)),
+                          style: ts(size: 6, color: PdfColors.grey400)),
                     ),
             ),
-            pw.Divider(color: PdfColors.grey300, thickness: 0.5, height: 6),
+            pw.Divider(color: PdfColors.grey300, thickness: 0.5, height: 4),
             pw.Row(
               children: [
-                pw.Text('Date  ', style: ts(size: 8, font: boldFont)),
+                pw.Text('Date  ', style: ts(size: 6, font: boldFont)),
                 pw.Expanded(
                   child:
-                      pw.Text(hasSig ? (date ?? '—') : '', style: ts(size: 9)),
+                      pw.Text(hasSig ? (date ?? '—') : '', style: ts(size: 6)),
                 ),
               ],
             ),
@@ -422,17 +419,94 @@ class SignaturePdfBuilder {
     }
 
     pw.Widget buildSignatureSection() {
-      final checkoutName =
-          isCheckOut ? assigneeName : priorCheckout?.assigneeName;
-      final checkoutDivision = isCheckOut ? division : priorCheckout?.division;
-      final checkoutDate = isCheckOut ? dateStr : priorCheckout?.dateStr;
-      final checkoutSig = isCheckOut ? sigBytes : priorCheckout?.sigBytes;
+      // Build one printable row per history entry — every checkout/checkin
+      // cycle this asset has ever had. If no history could be loaded (e.g.
+      // the asset has no id yet, or the Snipe-IT lookup failed), fall back
+      // to a single row built from just today's action so the PDF still
+      // shows at least the current signature.
+      final baseRows = historyRows.isNotEmpty
+          ? historyRows
+          : [
+              SignatureHistoryRow(
+                cycleId: 'current',
+                checkoutEntry: isCheckOut
+                    ? SignatureHistoryEntry(
+                        cycleId: 'current',
+                        action: 'Checkout',
+                        assigneeName: assigneeName,
+                        division: division,
+                        dateStr: dateStr,
+                        sigBytes: sigBytes,
+                        fileId: 0,
+                      )
+                    : null,
+                checkinEntry: isCheckOut
+                    ? null
+                    : SignatureHistoryEntry(
+                        cycleId: 'current',
+                        action: 'Checkin',
+                        assigneeName: assigneeName,
+                        division: division,
+                        dateStr: dateStr,
+                        sigBytes: sigBytes,
+                        fileId: 0,
+                      ),
+              ),
+            ];
 
-      final checkinDate = isCheckOut ? null : dateStr;
-      final checkinSig = isCheckOut ? null : sigBytes;
+      // Always reserve a minimum number of printable rows on the
+      // signature table, so the form comes out with blank rows ready for
+      // future checkout/checkin cycles — no need to regenerate the PDF
+      // just to add one more row later. Real history rows are always
+      // shown in full; empty rows are only appended to pad the count up
+      // to the minimum, never used to trim genuine history.
+      const minSignatureRows = 3;
+      final rows = <SignatureHistoryRow>[
+        ...baseRows,
+        for (var i = baseRows.length; i < minSignatureRows; i++)
+          SignatureHistoryRow(
+            cycleId: 'empty-$i',
+            checkoutEntry: null,
+            checkinEntry: null,
+          ),
+      ];
 
-      final displayName = checkoutName ?? assigneeName;
-      final displayDivision = checkoutDivision ?? division;
+      pw.TableRow buildDataRow(SignatureHistoryRow row) {
+        return pw.TableRow(
+          children: [
+            pw.Padding(
+              padding: const pw.EdgeInsets.all(4),
+              child: pw.Align(
+                alignment: pw.Alignment.topCenter,
+                child: pw.Text(
+                  row.displayName ?? '—',
+                  style: ts(size: 8, font: boldFont),
+                  textAlign: pw.TextAlign.center,
+                ),
+              ),
+            ),
+            pw.Padding(
+              padding: const pw.EdgeInsets.all(4),
+              child: pw.Align(
+                alignment: pw.Alignment.topCenter,
+                child: pw.Text(
+                  row.displayDivision ?? '—',
+                  style: ts(size: 8),
+                  textAlign: pw.TextAlign.center,
+                ),
+              ),
+            ),
+            buildSignatureCell(
+              sigImageBytes: row.checkoutEntry?.sigBytes,
+              date: row.checkoutEntry?.dateStr,
+            ),
+            buildSignatureCell(
+              sigImageBytes: row.checkinEntry?.sigBytes,
+              date: row.checkinEntry?.dateStr,
+            ),
+          ],
+        );
+      }
 
       return pw.Table(
         border: pw.TableBorder.all(width: 1.5),
@@ -452,119 +526,46 @@ class SignaturePdfBuilder {
               _tableHeader('Return', boldFont: boldFont, ts: ts),
             ],
           ),
-          pw.TableRow(
-            children: [
-              pw.Padding(
-                padding: const pw.EdgeInsets.all(8),
-                child: pw.Align(
-                  alignment: pw.Alignment.topCenter,
-                  child: pw.Text(
-                    displayName ?? '—',
-                    style: ts(font: boldFont),
-                    textAlign: pw.TextAlign.center,
-                  ),
-                ),
-              ),
-              pw.Padding(
-                padding: const pw.EdgeInsets.all(8),
-                child: pw.Align(
-                  alignment: pw.Alignment.topCenter,
-                  child: pw.Text(
-                    displayDivision ?? '—',
-                    style: ts(),
-                    textAlign: pw.TextAlign.center,
-                  ),
-                ),
-              ),
-              buildSignatureCell(
-                sigImageBytes: checkoutSig,
-                date: checkoutDate,
-              ),
-              buildSignatureCell(
-                sigImageBytes: checkinSig,
-                date: checkinDate,
-              ),
-            ],
-          ),
+          for (final row in rows) buildDataRow(row),
         ],
       );
     }
 
-    // Disabled: QR / document-verification section. Kept here (commented
-    // out) instead of deleted in case it needs to come back later.
-    //
-    // pw.Widget buildVerificationSection() {
-    //   return pw.Container(
-    //     decoration: pw.BoxDecoration(
-    //       border: pw.Border.all(width: 1.5),
-    //     ),
-    //     child: pw.Row(
-    //       crossAxisAlignment: pw.CrossAxisAlignment.start,
-    //       children: [
-    //         pw.Container(
-    //           width: 110,
-    //           padding: const pw.EdgeInsets.all(10),
-    //           decoration: const pw.BoxDecoration(
-    //             border: pw.Border(
-    //               right: pw.BorderSide(width: 1.5),
-    //             ),
-    //           ),
-    //           child: pw.Column(
-    //             children: [
-    //               pw.Image(pw.MemoryImage(qrPngBytes), width: 85, height: 85),
-    //               pw.SizedBox(height: 4),
-    //               pw.Text(AppConstants.scanToVerify,
-    //                   style: ts(size: 7, color: grey555),
-    //                   textAlign: pw.TextAlign.center),
-    //             ],
-    //           ),
-    //         ),
-    //         pw.Expanded(
-    //           child: pw.Padding(
-    //             padding: const pw.EdgeInsets.all(10),
-    //             child: pw.Column(
-    //               crossAxisAlignment: pw.CrossAxisAlignment.start,
-    //               children: [
-    //                 pw.Text(AppConstants.verificationHeader,
-    //                     style: ts(size: 8, font: boldFont, color: grey555)),
-    //                 pw.SizedBox(height: 6),
-    //                 pw.Text(verifyCode,
-    //                     style: pw.TextStyle(
-    //                       font: boldFont,
-    //                       fontSize: 16,
-    //                       letterSpacing: 4,
-    //                     )),
-    //                 pw.SizedBox(height: 6),
-    //                 pw.Text(
-    //                   'This code is generated from asset tag, recipient name, date, action and signature image hash. '
-    //                   'Any modification to this document will invalidate this code.',
-    //                   style: ts(size: 8, color: grey555),
-    //                 ),
-    //                 pw.SizedBox(height: 6),
-    //                 pw.Container(
-    //                   padding: const pw.EdgeInsets.symmetric(
-    //                       horizontal: 8, vertical: 5),
-    //                   decoration: pw.BoxDecoration(
-    //                     color: greyF5,
-    //                     borderRadius: pw.BorderRadius.circular(3),
-    //                   ),
-    //                   child: pw.Text(
-    //                     'ASSET: $tag  |  ACTION: $action  |  DATE: $dateStr  |  S/N: $serial',
-    //                     style: pw.TextStyle(
-    //                       font: baseFont,
-    //                       fontSize: 7,
-    //                       color: grey555,
-    //                     ),
-    //                   ),
-    //                 ),
-    //               ],
-    //             ),
-    //           ),
-    //         ),
-    //       ],
-    //     ),
-    //   );
-    // }
+    pw.Widget buildVerificationSection() {
+      return pw.Container(
+        decoration: pw.BoxDecoration(
+          border: pw.Border.all(width: 1.5),
+        ),
+        child: pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            // QR code disabled — the qrPngBytes param above and the
+            // generateQrPngBytes() call in signature_dialog.dart are
+            // commented out too. Uncomment all three spots to bring it
+            // back.
+            //
+            // pw.Container(
+            //   width: 110,
+            //   padding: const pw.EdgeInsets.all(10),
+            //   decoration: const pw.BoxDecoration(
+            //     border: pw.Border(
+            //       right: pw.BorderSide(width: 1.5),
+            //     ),
+            //   ),
+            //   child: pw.Column(
+            //     children: [
+            //       pw.Image(pw.MemoryImage(qrPngBytes!), width: 85, height: 85),
+            //       pw.SizedBox(height: 4),
+            //       pw.Text(AppConstants.scanToVerify,
+            //           style: ts(size: 7, color: grey555),
+            //           textAlign: pw.TextAlign.center),
+            //     ],
+            //   ),
+            // ),
+          ],
+        ),
+      );
+    }
 
     pw.Widget buildFooter() {
       return pw.Text(
@@ -575,29 +576,30 @@ class SignaturePdfBuilder {
     }
 
     doc.addPage(
-      pw.Page(
+      pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
         margin: const pw.EdgeInsets.symmetric(horizontal: 40, vertical: 32),
-        build: (context) {
-          return pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-            children: [
-              buildHeader(),
-              pw.SizedBox(height: 8),
-              buildDeviceTypeAndAssetNumber(),
-              pw.SizedBox(height: 8),
-              buildHardwareSection(),
-              pw.SizedBox(height: 8),
-              buildRemarkSection(),
-              pw.SizedBox(height: 14),
-              buildSignatureSection(),
-              // pw.SizedBox(height: 14),
-              // buildVerificationSection(), // QR verification disabled
-              pw.Spacer(),
-              buildFooter(),
-            ],
-          );
-        },
+        // Printed on every page (not just the last), which also gives a
+        // natural "this document continues..." cue when the signature
+        // history table spills onto page 2+.
+        footer: (context) => buildFooter(),
+        build: (context) => [
+          buildHeader(),
+          pw.SizedBox(height: 8),
+          buildDeviceTypeAndAssetNumber(),
+          pw.SizedBox(height: 8),
+          buildHardwareSection(),
+          pw.SizedBox(height: 8),
+          buildRemarkSection(),
+          pw.SizedBox(height: 14),
+          // pw.Table implements SpanningWidget, so when there are enough
+          // history rows to overflow the page, MultiPage automatically
+          // continues it onto a new page instead of clipping it — unlike
+          // the old pw.Page, which had no pagination at all.
+          buildSignatureSection(),
+          pw.SizedBox(height: 14),
+          buildVerificationSection(),
+        ],
       ),
     );
 
@@ -634,9 +636,9 @@ class SignaturePdfBuilder {
     required PdfTextStyleBuilder ts,
   }) {
     return pw.Padding(
-      padding: const pw.EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+      padding: const pw.EdgeInsets.symmetric(vertical: 3, horizontal: 4),
       child: pw.Text(text,
-          style: ts(font: boldFont), textAlign: pw.TextAlign.center),
+          style: ts(size: 8, font: boldFont), textAlign: pw.TextAlign.center),
     );
   }
 }

@@ -8,22 +8,28 @@ import 'package:signature/signature.dart';
 
 import '../../models/asset_model.dart';
 import '../../utils/app_constants.dart';
-import 'document_verification.dart';
 import 'font_cache.dart';
-import 'prior_checkout_record.dart';
-import 'qr_code_generator.dart';
+// import 'qr_code_generator.dart'; // QR disabled — see comments below
 import 'signature_export_utils.dart';
+import 'signature_history_entry.dart';
 import 'signature_pdf_builder.dart';
 import 'snipeit_file_api.dart';
 
-export 'prior_checkout_record.dart' show PriorCheckoutRecord;
+export 'signature_history_entry.dart'
+    show SignatureHistoryEntry, SignatureHistoryRow;
 
 /// Opens the signature-capture dialog and, once signed, generates the
 /// "Assets Profile" checkout/checkin PDF and uploads it to Snipe-IT.
 ///
-/// See `prior_checkout_record.dart` for how to pass in [priorCheckout]
-/// manually if you already have the checkout record from another source;
-/// otherwise it's looked up automatically from Snipe-IT on checkin.
+/// The PDF's signature table always shows the asset's *full* checkout/
+/// checkin history (every person who's ever had it). That history is no
+/// longer stored as separate PNG files — it's embedded as JSON (including
+/// every signature image, base64-encoded) in the `notes` field of the
+/// single PDF file kept per asset. Every time a new PDF is generated, the
+/// previous PDF's embedded history is read back out, merged with today's
+/// signing event, and re-embedded in the new PDF before the old one is
+/// deleted — see `signature_history_entry.dart` and
+/// `SnipeItFileApi.fetchSignatureHistory` / `uploadPdf`.
 Future<Uint8List?> showSignatureDialog({
   required BuildContext context,
   required String title,
@@ -32,7 +38,6 @@ Future<Uint8List?> showSignatureDialog({
   String? assigneeName,
   String? division,
   bool isCheckOut = true,
-  PriorCheckoutRecord? priorCheckout,
 }) {
   return showDialog<Uint8List?>(
     context: context,
@@ -44,7 +49,6 @@ Future<Uint8List?> showSignatureDialog({
       assigneeName: assigneeName,
       division: division,
       isCheckOut: isCheckOut,
-      priorCheckout: priorCheckout,
     ),
   );
 }
@@ -56,7 +60,6 @@ class _SignatureDialog extends StatefulWidget {
   final String? assigneeName;
   final String? division;
   final bool isCheckOut;
-  final PriorCheckoutRecord? priorCheckout;
 
   const _SignatureDialog({
     required this.title,
@@ -65,7 +68,6 @@ class _SignatureDialog extends StatefulWidget {
     this.assigneeName,
     this.division,
     this.isCheckOut = true,
-    this.priorCheckout,
   });
 
   @override
@@ -145,7 +147,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
 
   // ── Generate the PDF and upload it (+ related artifacts) to Snipe-IT ─────
 
-  Future<void> _generateAndUploadPdf(Uint8List sigBytes) async {
+ Future<void> _generateAndUploadPdf(Uint8List sigBytes) async {
     final now = DateTime.now();
     final dateStr =
         '${now.day}/${now.month}/${now.year} ${now.hour}:${now.minute.toString().padLeft(2, '0')}';
@@ -153,38 +155,24 @@ class _SignatureDialogState extends State<_SignatureDialog> {
     final asset = widget.asset!;
     final action = widget.isCheckOut ? 'Checkout' : 'Checkin';
 
-    // For a checkin, if the caller didn't already pass in a
-    // PriorCheckoutRecord, try to auto-recover the checkout signature/info
-    // we saved to Snipe-IT when this asset was checked out, so the
-    // "Receive" box on this checkin PDF isn't blank.
-    PriorCheckoutRecord? priorCheckout = widget.priorCheckout;
-    if (!widget.isCheckOut && priorCheckout == null && asset.id != null) {
-      priorCheckout = await _snipeItApi.fetchPriorCheckoutRecord(
-        assetId: asset.id!,
-        assigneeName: widget.assigneeName,
-        division: widget.division,
-      );
+    // A cycleId ties this checkout to its matching checkin so they print
+    // as one row in the history table:
+    // - Checkout: always mints a brand new cycleId (a new hand-off starts
+    //   a new cycle, even if an older one was somehow left open).
+    // - Checkin: reuses whatever open cycle is currently on record for
+    //   this asset (the most recent checkout without a matching checkin
+    //   yet). If none is found — e.g. this app wasn't used for the
+    //   original checkout — a fresh cycleId is minted so the checkin still
+    //   gets its own row instead of being dropped.
+    String cycleId;
+    if (widget.isCheckOut) {
+      cycleId = 'C${now.millisecondsSinceEpoch}';
+    } else {
+      cycleId = (asset.id != null
+              ? await _snipeItApi.findOpenCycleId(assetId: asset.id!)
+              : null) ??
+          'C${now.millisecondsSinceEpoch}';
     }
-
-    final verifyCode = DocumentVerification.generateVerificationCode(
-      assetTag: asset.assetTag ?? '—',
-      assigneeName: widget.assigneeName ?? '—',
-      dateStr: dateStr,
-      action: action,
-      sigBytes: sigBytes,
-    );
-
-    final qrData = [
-      'ASSET:${asset.assetTag ?? '—'}',
-      'ACTION:$action',
-      'RECIPIENT:${widget.assigneeName ?? '—'}',
-      'DIVISION:${widget.division ?? '—'}',
-      'DATE:$dateStr',
-      'SERIAL:${asset.serial ?? '—'}',
-      'VERIFY:$verifyCode',
-    ].join('\n');
-
-    final qrPngBytes = await generateQrPngBytes(qrData);
 
     await FontCache.ensureLoaded();
 
@@ -197,53 +185,154 @@ class _SignatureDialogState extends State<_SignatureDialog> {
       debugPrint('=== [PDF] Failed to load logo: $e\n$st');
     }
 
-    final pdfBytes = await _pdfBuilder.build(
-      action: action,
-      dateStr: dateStr,
-      asset: asset,
-      assigneeName: widget.assigneeName ?? '—',
-      division: widget.division ?? '—',
-      sigBytes: sigBytes,
-      qrPngBytes: qrPngBytes,
-      isCheckOut: widget.isCheckOut,
-      logoBytes: logoBytes,
-      verifyCode: verifyCode,
-      sarabunRegular: FontCache.sarabunRegular,
-      sarabunBold: FontCache.sarabunBold,
-      priorCheckout: priorCheckout,
-    );
-
     // Upload PDF ไปยัง Snipe-IT
     try {
-      await _snipeItApi.uploadPdf(
+      // Fetch the existing history (every cycle recorded on the current
+      // *active* PDF, with signature images already embedded as base64)
+      // *before* touching anything else, then merge in today's signing
+      // event.
+      final historyResult = asset.id != null
+          ? await _snipeItApi.fetchSignatureHistory(assetId: asset.id!)
+          : (rows: <SignatureHistoryRow>[], sourceFileId: null);
+      final historyRowsBefore = historyResult.rows;
+      final previousFileId = historyResult.sourceFileId;
+
+      final newEntry = SignatureHistoryEntry(
+        cycleId: cycleId,
+        action: action,
+        assigneeName: widget.assigneeName ?? '—',
+        division: widget.division,
+        dateStr: dateStr,
+        sigBytes: sigBytes,
+        fileId: 0,
+      );
+
+      // Merge the new entry into the existing rows (matching on cycleId),
+      // then re-sort so the table stays chronological.
+      final mergedRows = <String, SignatureHistoryRow>{
+        for (final r in historyRowsBefore) r.cycleId: r,
+      };
+      final existingRow = mergedRows[cycleId];
+      mergedRows[cycleId] = SignatureHistoryRow(
+        cycleId: cycleId,
+        checkoutEntry:
+            newEntry.isCheckout ? newEntry : existingRow?.checkoutEntry,
+        checkinEntry:
+            newEntry.isCheckout ? existingRow?.checkinEntry : newEntry,
+      );
+      final orderedCycleIds = mergedRows.keys.toList()..sort();
+
+      // Snipe-IT's `notes` field has a practical size limit, and every
+      // cycle kept adds a base64-encoded signature image to it. Cap each
+      // PDF to a fixed number of cycles — once merging today's event
+      // would exceed that cap, leave the current PDF (with its full
+      // history) untouched forever as an archive, and start a brand new
+      // PDF/history containing only today's signing event. Over many
+      // uses this produces a series of archived PDFs on the asset instead
+      // of one ever-growing file — nothing is ever silently dropped.
+      const maxHistoryCycles = 3;
+      List<SignatureHistoryRow> historyRows;
+      // `>` (not `>=`): a PDF keeps accumulating cycles up to and
+      // including `maxHistoryCycles` — it's only once a cycle *beyond*
+      // that would be merged in that a fresh PDF/history starts instead.
+      // This is what lets an archived PDF end up holding the full
+      // `maxHistoryCycles` cycles rather than one short of it. (Note-
+      // stripping for a PDF that's reached the cap happens separately,
+      // right below, as soon as every one of its cycles is closed — it
+      // doesn't wait for this branch to fire.)
+      final startingFreshArchive = orderedCycleIds.length > maxHistoryCycles;
+
+      if (startingFreshArchive) {
+        historyRows = [mergedRows[cycleId]!];
+        debugPrint('=== [History] $maxHistoryCycles-cycle cap reached — '
+            'archiving previous PDF (file $previousFileId) and starting '
+            'a fresh history');
+      } else {
+        historyRows = [
+          for (final id in orderedCycleIds) mergedRows[id]!,
+        ];
+      }
+
+      // Flatten back to individual entries for embedding in the new PDF's
+      // notes field.
+      final flatHistoryEntries = <SignatureHistoryEntry>[
+        for (final row in historyRows) ...[
+          if (row.checkoutEntry != null) row.checkoutEntry!,
+          if (row.checkinEntry != null) row.checkinEntry!,
+        ],
+      ];
+
+      final pdfBytes = await _pdfBuilder.build(
+        action: action,
+        dateStr: dateStr,
+        asset: asset,
+        assigneeName: widget.assigneeName ?? '—',
+        division: widget.division ?? '—',
+        sigBytes: sigBytes,
+        // qrPngBytes: qrPngBytes, // QR disabled — see comments above
+        isCheckOut: widget.isCheckOut,
+        logoBytes: logoBytes,
+        sarabunRegular: FontCache.sarabunRegular,
+        sarabunBold: FontCache.sarabunBold,
+        historyRows: historyRows,
+      );
+
+      final uploadResult = await _snipeItApi.uploadPdf(
         pdfBytes: pdfBytes,
         action: action,
         asset: asset,
         assigneeName: widget.assigneeName,
+        historyEntries: flatHistoryEntries,
       );
 
-      debugPrint('=== [Upload PDF] success');
+      debugPrint('=== [Upload PDF] success (file ${uploadResult.fileId})');
 
-      // On a successful CHECKOUT, also stash just the signature PNG so a
-      // future checkin of this same asset can pull it back automatically.
-      // This is `await`-ed (not `unawaited`) so a checkin started moments
-      // later can't race the upload and see it as "missing" — the upload
-      // still swallows its own errors internally, so this never blocks a
-      // successful checkout.
-      if (widget.isCheckOut) {
-        await _snipeItApi.uploadCheckoutSignature(
-          sigBytes: sigBytes,
-          asset: asset,
-          dateStr: dateStr,
-          assigneeName: widget.assigneeName,
-          division: widget.division,
+      // The previous version of the active file — the one whose history
+      // this upload just continued — is always redundant now, whether or
+      // not this upload also happens to have hit the cap: everything it
+      // held has been folded into the PDF just uploaded.
+      if (asset.id != null && !startingFreshArchive && previousFileId != null) {
+        await _snipeItApi.deletePdfFile(
+          assetId: asset.id!,
+          fileId: previousFileId,
         );
-      } else if (asset.id != null) {
-        // On a successful CHECKIN, remove the checkout PDF and the
-        // standalone checkout-signature PNG from this asset. This runs
-        // only after the checkin PDF itself uploaded successfully, and
-        // never blocks or fails the checkin if cleanup has trouble.
-        await _snipeItApi.deleteCheckoutArtifacts(asset.id!);
+      }
+
+      // Has the PDF just uploaded reached the cap with every cycle fully
+      // closed (no dangling checkout waiting on its checkin)? If so, it
+      // will never be written to again — the next new cycle always
+      // starts a fresh PDF — so its note (the JSON history blob, every
+      // signature image included) is safe to strip right now instead of
+      // lingering until that next PDF appears.
+      final closedOutAtCap = !startingFreshArchive &&
+          historyRows.length == maxHistoryCycles &&
+          historyRows.every(
+              (row) => row.checkoutEntry != null && row.checkinEntry != null);
+
+      if (asset.id != null && closedOutAtCap && uploadResult.fileId != null) {
+        debugPrint('=== [History] $maxHistoryCycles-cycle cap reached with '
+            'every cycle closed — stripping note from file '
+            '${uploadResult.fileId} now');
+        await _snipeItApi.finalizeClosedCycleFile(
+          assetId: asset.id!,
+          fileId: uploadResult.fileId!,
+          pdfBytes: pdfBytes,
+          fileName: uploadResult.fileName,
+        );
+      } else if (asset.id != null &&
+          startingFreshArchive &&
+          previousFileId != null) {
+        // Safety net: the cap was exceeded (a cycle beyond
+        // maxHistoryCycles just came in), which normally means the old
+        // file should already have had its note stripped by the
+        // `closedOutAtCap` branch above in an earlier run. If that didn't
+        // happen for some reason, catch it here via a fresh
+        // download-and-reupload instead of leaving the note in place
+        // forever.
+        await _snipeItApi.clearArchivedFileNote(
+          assetId: asset.id!,
+          fileId: previousFileId,
+        );
       }
     } catch (e, st) {
       debugPrint('=== [Upload PDF] error: $e\n$st');
