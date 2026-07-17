@@ -479,7 +479,7 @@ class _SignatureDialogState extends State<_SignatureDialog> {
                             ]),
                             SizedBox(height: 6),
                             Text(
-                              'Remark: The employee acknowledges that the Hardware received is the property of Stream I.T. Consulting Ltd. '
+                              'Remark: The employee acknowledges that the Hardware received is the property of company. '
                               'The employee agrees to take care of and maintain the Hardware and a standard no lower than that which a person, '
                               'in general, would be expected to maintain. The hardware is possessed by the employee for work only.',
                               style: TextStyle(

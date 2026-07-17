@@ -33,6 +33,16 @@ String _cf(AssetModel asset, String key) {
   return _htmlUnescape.convert(raw);
 }
 
+/// Activity-log actions we want to surface to the user in the History tab.
+/// Snipe-IT also logs a 'upload' entry every time we attach the signature
+/// PNG (base64) to the asset/user record — that entry is just noise for
+/// this screen (it's huge base64 text, not something the user needs to
+/// read), so we filter the log down to just checkout/checkin here.
+bool _isVisibleHistoryAction(String? action) {
+  final a = action?.toLowerCase().trim() ?? '';
+  return a.contains('checkout') || a.contains('checkin');
+}
+
 class AssetDetailsScreen extends StatefulWidget {
   final AssetModel asset;
 
@@ -90,7 +100,10 @@ class _AssetDetailsScreenState extends State<AssetDetailsScreen>
     });
     try {
       final log = await _service.getAssetHistory(_asset.id!);
-      if (mounted) setState(() => _history = log);
+      // เก็บเฉพาะ checkin/checkout ตั้งแต่ตอนโหลด ไม่ต้องกรองซ้ำทุกครั้งที่ build
+      final filtered =
+          log.where((e) => _isVisibleHistoryAction(e.action)).toList();
+      if (mounted) setState(() => _history = filtered);
     } catch (e) {
       if (mounted) setState(() => _historyError = e.toString());
     } finally {
@@ -590,7 +603,10 @@ class _WarrantyLabel extends StatelessWidget {
 }
 
 // ── History Tab ────────────────────────────────────────────────────────────
-
+// NOTE: `history` ที่ส่งเข้ามาถูกกรองไว้แล้วตั้งแต่ _loadHistory() ใน
+// AssetDetailsScreen (เหลือแค่ action ที่เป็น checkin/checkout) แต่ยังกรอง
+// ซ้ำอีกชั้นตรงนี้ด้วย เผื่อในอนาคตมีที่อื่นส่ง history เข้ามาโดยไม่ได้
+// กรองมาก่อน จะได้ไม่มี entry ประเภท upload หลุดมาแสดงโดยไม่ตั้งใจ
 class _HistoryTab extends StatelessWidget {
   final List<ActivityModel> history;
   final bool isLoading;
@@ -608,7 +624,11 @@ class _HistoryTab extends StatelessWidget {
   Widget build(BuildContext context) {
     if (isLoading) return const Center(child: CircularProgressIndicator());
     if (error != null) return ErrorBanner(message: error!, onRetry: onRetry);
-    if (history.isEmpty) {
+
+    final visibleHistory =
+        history.where((e) => _isVisibleHistoryAction(e.action)).toList();
+
+    if (visibleHistory.isEmpty) {
       return const EmptyState(
         icon: Icons.history_toggle_off_outlined,
         message: 'ไม่พบประวัติการใช้งาน',
@@ -617,9 +637,9 @@ class _HistoryTab extends StatelessWidget {
 
     return ListView.separated(
       padding: const EdgeInsets.symmetric(vertical: 12),
-      itemCount: history.length,
+      itemCount: visibleHistory.length,
       separatorBuilder: (_, __) => const SizedBox(height: 2),
-      itemBuilder: (_, i) => _HistoryTile(entry: history[i]),
+      itemBuilder: (_, i) => _HistoryTile(entry: visibleHistory[i]),
     );
   }
 }

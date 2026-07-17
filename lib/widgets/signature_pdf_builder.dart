@@ -230,8 +230,8 @@ class SignaturePdfBuilder {
               // กล่องที่ 1: checkbox ประเภทอุปกรณ์
               pw.Container(
                 alignment: pw.Alignment.centerLeft,
-                padding: const pw.EdgeInsets.symmetric(
-                    horizontal: 12, vertical: 5),
+                padding:
+                    const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 5),
                 decoration: pw.BoxDecoration(
                   color: greyF0,
                   border: pw.Border.all(width: 1.5),
@@ -290,6 +290,8 @@ class SignaturePdfBuilder {
 
     pw.Widget buildHardwareSection() {
       return pw.Container(
+        padding:
+            const pw.EdgeInsets.all(0.75), // เผื่อพื้นที่ให้ border width 1.5
         decoration: pw.BoxDecoration(
           border: pw.Border.all(width: 1.5),
         ),

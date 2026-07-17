@@ -106,6 +106,21 @@ class _ScannerScreenState extends State<ScannerScreen>
       facing: CameraFacing.back,
       torchEnabled: false,
       autoStart: false,
+      // Barcode-only: restrict detection to common 1D linear symbologies
+      // used on asset tags. QR / DataMatrix / Aztec / PDF417 (2D / stacked
+      // codes) are intentionally excluded now that this screen is
+      // barcode-only.
+      formats: const [
+        BarcodeFormat.code128,
+        BarcodeFormat.code39,
+        BarcodeFormat.code93,
+        BarcodeFormat.codabar,
+        BarcodeFormat.ean8,
+        BarcodeFormat.ean13,
+        BarcodeFormat.itf,
+        BarcodeFormat.upcA,
+        BarcodeFormat.upcE,
+      ],
     );
     _controllerAttached = false;
     if (mounted) {
@@ -235,7 +250,7 @@ class _ScannerScreenState extends State<ScannerScreen>
       } else {
         setState(() {
           _lastError = 'ไม่พบ Asset Tag "$tag" ในระบบ\n'
-              'กรุณาตรวจสอบ QR Code หรือติดต่อผู้ดูแลระบบ';
+              'กรุณาตรวจสอบ Barcode หรือติดต่อผู้ดูแลระบบ';
         });
       }
     } catch (e) {
@@ -273,7 +288,7 @@ class _ScannerScreenState extends State<ScannerScreen>
           autofocus: true,
           decoration: const InputDecoration(
             hintText: 'กรอก Asset Tag',
-            prefixIcon: Icon(Icons.qr_code),
+            prefixIcon: Icon(Icons.barcode_reader),
           ),
           textCapitalization: TextCapitalization.characters,
           onSubmitted: (v) => Navigator.of(ctx).pop(v.trim()),
@@ -498,9 +513,14 @@ class _ScanOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.sizeOf(context);
-    const windowSize = 260.0;
-    final top = (size.height - windowSize) / 2 - 60;
-    final left = (size.width - windowSize) / 2;
+    // Barcode-only scan window: 1D barcodes are wide and short, so the
+    // window is a narrow horizontal band rather than the square used for
+    // QR codes. This also lets the user scan from further away since the
+    // camera no longer needs to resolve a large square area.
+    const windowWidth = 260.0;
+    const windowHeight = 120.0;
+    final top = (size.height - windowHeight) / 2 - 60;
+    final left = (size.width - windowWidth) / 2;
 
     return Stack(
       children: [
@@ -516,8 +536,8 @@ class _ScanOverlay extends StatelessWidget {
               top: top,
               left: left,
               child: Container(
-                width: windowSize,
-                height: windowSize,
+                width: windowWidth,
+                height: windowHeight,
                 decoration: BoxDecoration(
                     color: Colors.black,
                     borderRadius: BorderRadius.circular(12)),
@@ -525,13 +545,16 @@ class _ScanOverlay extends StatelessWidget {
             ),
           ]),
         ),
-        Positioned(top: top, left: left, child: _CornerFrame(size: windowSize)),
+        Positioned(
+            top: top,
+            left: left,
+            child: _CornerFrame(width: windowWidth, height: windowHeight)),
         Positioned(
           top: top + 4,
           left: left + 4,
           child: SizedBox(
-            width: windowSize - 8,
-            height: windowSize - 8,
+            width: windowWidth - 8,
+            height: windowHeight - 8,
             child: AnimatedBuilder(
               animation: lineAnimation,
               builder: (_, __) => Align(
@@ -558,11 +581,11 @@ class _ScanOverlay extends StatelessWidget {
           ),
         ),
         Positioned(
-          top: top + windowSize + 16,
+          top: top + windowHeight + 16,
           left: 0,
           right: 0,
           child: const Text(
-            'วาง QR Code ให้อยู่ในกรอบ',
+            'วาง Barcode ให้อยู่ในกรอบ',
             textAlign: TextAlign.center,
             style: TextStyle(
                 color: Colors.white70,
@@ -576,16 +599,17 @@ class _ScanOverlay extends StatelessWidget {
 }
 
 class _CornerFrame extends StatelessWidget {
-  final double size;
-  const _CornerFrame({required this.size});
+  final double width;
+  final double height;
+  const _CornerFrame({required this.width, required this.height});
 
   @override
   Widget build(BuildContext context) {
     const l = 24.0, s = 3.0;
     const color = AppConstants.accentBlue;
     return SizedBox(
-      width: size,
-      height: size,
+      width: width,
+      height: height,
       child: Stack(children: [
         Positioned(
             top: 0,
